@@ -15,6 +15,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/Luo-root/pulse/components/schema"
 	"github.com/Luo-root/pulse/components/tools"
+	"github.com/charmbracelet/glamour"
 )
 
 /*
@@ -94,10 +95,11 @@ const (
 )
 
 type message struct {
-	role      role
-	content   string
-	toolCalls []toolCallRecord // ← 新增：持久化的工具调用
-	ts        time.Time
+	role            role
+	content         string
+	toolCalls       []toolCallRecord // ← 新增：持久化的工具调用
+	ts              time.Time
+	renderedContent string
 }
 
 type thinkingTickMsg struct{}
@@ -173,8 +175,11 @@ type model struct {
 	confirmState *confirmState         // 共享白名单
 	mode         string                // "safe" | "auto"
 
-	manager *worker.Manager
-	ctx     context.Context
+	showHelp bool // ← 新增：是否显示帮助面板
+
+	manager   *worker.Manager
+	ctx       context.Context
+	gRenderer *glamour.TermRenderer
 }
 
 func initialModel(
@@ -388,11 +393,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "ctrl+s":
 			return m.handleSend()
+		case "ctrl+l":
+			m.messages = nil
+			m.showHelp = false
+			m.refreshContent()
+			return m, nil
+		case "f1":
+			m.showHelp = !m.showHelp
+			if m.showHelp {
+				m.viewport.SetContent(m.renderHelp())
+			} else {
+				m.refreshContent()
+			}
+			return m, nil
+		case "esc":
+			if m.showHelp {
+				m.showHelp = false
+				m.refreshContent()
+				return m, nil
+			}
 		case "pgup":
-			m.viewport.PageUp()
+			if !m.showHelp {
+				m.viewport.PageUp()
+			}
 			return m, nil
 		case "pgdown":
-			m.viewport.PageDown()
+			if !m.showHelp {
+				m.viewport.PageDown()
+			}
 			return m, nil
 		}
 
@@ -468,6 +496,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.toolCalls = nil
+
+		// ── 渲染 markdown ──
+		if len(m.messages) > 0 {
+			last := &m.messages[len(m.messages)-1]
+			if last.role == roleAI && last.renderedContent == "" {
+				last.renderedContent = m.glamourRender(last.content)
+			}
+		}
+
 		m.refreshContent()
 		m.viewport.GotoBottom()
 		return m, nil
@@ -495,6 +532,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.layout()
+		m.setupGlamour()
+		// 窗口大小变了，重新渲染所有已完成的消息
+		for i := range m.messages {
+			if m.messages[i].role == roleAI && m.messages[i].renderedContent != "" {
+				m.messages[i].renderedContent = m.glamourRender(m.messages[i].content)
+			}
+		}
+		m.refreshContent()
 		return m, nil
 	}
 
@@ -594,6 +639,13 @@ func (m *model) refreshContent() {
 	if m.viewport.Width() == 0 {
 		return
 	}
+
+	// 帮助面板激活时，不覆盖
+	if m.showHelp {
+		m.viewport.SetContent(m.renderHelp())
+		return
+	}
+
 	var sections []string
 	hasActive := len(m.toolCalls) > 0 || len(m.confirmQueue) > 0
 
@@ -664,11 +716,10 @@ func (m model) renderMessage(msg message) string {
 	case roleUser:
 		sections = append(sections, m.renderUserBubble(msg.content))
 	case roleAI:
-		// 已完成的工具调用（历史消息中）
 		if len(msg.toolCalls) > 0 {
 			sections = append(sections, m.renderToolCallsSection(msg.toolCalls))
 		}
-		sections = append(sections, m.renderAIBubble(msg.content))
+		sections = append(sections, m.renderAIBubble(msg.content, msg.renderedContent))
 	}
 	ts := tsStyle.Render("  " + msg.ts.Format("15:04"))
 	sections = append(sections, ts)
@@ -750,18 +801,25 @@ func (m model) renderUserBubble(content string) string {
 		Width(cw).Align(lipgloss.Right).Render(bubble)
 }
 
-func (m model) renderAIBubble(content string) string {
+func (m model) renderAIBubble(content string, rendered string) string {
 	cw := m.contentWidth()
 	bubbleW := max(30, cw*75/100)
 	innerW := bubbleW - 4
 
-	rendered := lipgloss.NewStyle().
-		Width(innerW).Foreground(cText).Render(content)
+	var renderedContent string
+	if rendered != "" {
+		renderedContent = lipgloss.NewStyle().
+			Width(innerW).Render(rendered)
+	} else {
+		renderedContent = lipgloss.NewStyle().
+			Width(innerW).Foreground(cText).Render(content)
+	}
+
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(cMauve).
 		Padding(0, 1).
-		Render(rendered)
+		Render(renderedContent)
 }
 
 func (m model) renderThinking() string {
@@ -807,10 +865,17 @@ func (m model) renderFooter() string {
 		m.viewport.ScrollPercent()*100,
 		m.viewport.HorizontalScrollPercent()*100,
 	))
-	line := lipgloss.NewStyle().Foreground(cSurface1).Render(
-		strings.Repeat("─", max(0, m.width-lipgloss.Width(info))),
-	)
-	return lipgloss.JoinHorizontal(lipgloss.Center, line, info)
+
+	hints := lipgloss.NewStyle().Foreground(cOverlay0).Render(m.footerHints())
+	hintsW := lipgloss.Width(hints)
+	infoW := lipgloss.Width(info)
+	lineW := max(0, m.width-hintsW-infoW)
+
+	line := "\n" + hints +
+		lipgloss.NewStyle().Foreground(cSurface1).Render(
+			strings.Repeat("─", lineW))
+
+	return lipgloss.JoinHorizontal(lipgloss.Left, line, info)
 }
 
 // ── View ───────────────────────────────────────────────────────────────

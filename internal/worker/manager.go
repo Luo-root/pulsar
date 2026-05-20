@@ -71,3 +71,11 @@ func (m *Manager) GetRegistry() *tools.ToolRegistry {
 func (m *Manager) GetMode() string {
 	return m.config.Worker.Mode
 }
+
+func (m *Manager) GetMcpManager() *mcp.Manager {
+	return m.mcp
+}
+
+func (m *Manager) GetSkillLoader() *skill.SkillLoader {
+	return m.skill
+}

@@ -12,3 +12,12 @@ func (m *Manager) InitWorker() {
 		agent.WithMaxToolRounds(m.config.Worker.MaxToolRounds),
 	)
 }
+
+func (m *Manager) DisposableWorker() *agent.Agent {
+	return agent.NewAgent(
+		m.chatModel,
+		m.registry,
+		agent.WithUsageTracker(m.worker.GetUsageTracker()),
+		agent.WithMaxToolRounds(m.config.Worker.MaxToolRounds),
+	)
+}
