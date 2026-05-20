@@ -2,6 +2,7 @@ package bootloader
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"time"
 
@@ -74,6 +75,15 @@ func initialModel() model {
 	baseUrlInput.Placeholder = "https://api.example.com/v1"
 	baseUrlInput.SetWidth(30)
 	baseUrlInput.Prompt = "" // 隐藏提示符
+	baseUrlInput.Validate = func(s string) error {
+		if s == "" {
+			return nil // 空的时候不报错，等用户输完
+		}
+		if _, err := url.ParseRequestURI(s); err != nil {
+			return fmt.Errorf("无效的 URL 格式")
+		}
+		return nil
+	}
 
 	apiKeyInput := textinput.New()
 	apiKeyInput.Blur() // 初始不聚焦
@@ -82,6 +92,12 @@ func initialModel() model {
 	apiKeyInput.SetWidth(100)
 	apiKeyInput.Prompt = ""
 	apiKeyInput.EchoMode = textinput.EchoPassword
+	apiKeyInput.Validate = func(s string) error {
+		if s != "" && len(s) < 10 {
+			return fmt.Errorf("密钥长度过短")
+		}
+		return nil
+	}
 
 	return model{
 		currentStep: stepAPI,
@@ -193,7 +209,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.input.focusedInput = 0
 			} else if m.currentStep == stepConfig {
 				// 验证输入
-				if m.input.baseUrlInput.Value() == "" || m.input.apiKeyInput.Value() == "" {
+				if !m.input.saveConfig() {
 					return m, nil
 				}
 				// 开始加载模型列表

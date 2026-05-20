@@ -6,6 +6,7 @@ import (
 	"os"
 	"pulse-tui/internal/worker"
 	"strings"
+	"sync"
 	"time"
 
 	"charm.land/bubbles/v2/textarea"
@@ -13,6 +14,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/Luo-root/pulse/components/schema"
+	"github.com/Luo-root/pulse/components/tools"
 )
 
 /*
@@ -116,6 +118,25 @@ type toolEvent struct {
 
 type toolEventMsg struct{ event toolEvent }
 
+// ── Tool confirm types ────────────────────────────────────────────────
+
+type toolConfirmEvent struct {
+	Name       string
+	Args       map[string]any
+	Permission tools.ToolPermission
+	Resp       chan bool
+}
+
+type toolConfirmReqMsg struct {
+	event toolConfirmEvent
+}
+
+// confirmState 与 hook 共享，通过 mutex 保护
+type confirmState struct {
+	mu          sync.Mutex
+	autoAllowed map[string]bool
+}
+
 type toolCallRecord struct {
 	name      string
 	args      map[string]any
@@ -123,6 +144,7 @@ type toolCallRecord struct {
 	duration  time.Duration
 	done      bool
 	isError   bool
+	denied    bool
 }
 
 // ── Model ──────────────────────────────────────────────────────────────
@@ -145,11 +167,24 @@ type model struct {
 	toolCtx    context.Context  // 用于取消 tool 事件轮询
 	toolCancel context.CancelFunc
 
+	// ── 新增 ──
+	confirmCh    chan toolConfirmEvent // hook 写入确认请求
+	confirmQueue []toolConfirmEvent    // 待确认队列
+	confirmState *confirmState         // 共享白名单
+	mode         string                // "safe" | "auto"
+
 	manager *worker.Manager
 	ctx     context.Context
 }
 
-func initialModel(ctx context.Context, manager *worker.Manager, toolEvents chan toolEvent) model {
+func initialModel(
+	ctx context.Context,
+	manager *worker.Manager,
+	toolEvents chan toolEvent,
+	confirmCh chan toolConfirmEvent,
+	mode string,
+	confirmSt *confirmState,
+) model {
 	ta := textarea.New()
 	ta.Placeholder = "Send a message... (Ctrl+S to send)"
 	ta.SetVirtualCursor(false)
@@ -165,10 +200,13 @@ func initialModel(ctx context.Context, manager *worker.Manager, toolEvents chan 
 	ta.SetStyles(s)
 
 	return model{
-		textarea:   ta,
-		manager:    manager,
-		ctx:        ctx,
-		toolEvents: toolEvents,
+		textarea:     ta,
+		manager:      manager,
+		ctx:          ctx,
+		toolEvents:   toolEvents,
+		confirmCh:    confirmCh,
+		confirmState: confirmSt,
+		mode:         mode,
 	}
 }
 
@@ -206,6 +244,17 @@ func readToolEventCmd(ctx context.Context, ch <-chan toolEvent) tea.Cmd {
 	}
 }
 
+func readConfirmCmd(ctx context.Context, ch <-chan toolConfirmEvent) tea.Cmd {
+	return func() tea.Msg {
+		select {
+		case event := <-ch:
+			return toolConfirmReqMsg{event: event}
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}
+
 func (m *model) applyToolEvent(event toolEvent) {
 	switch event.Phase {
 	case "before":
@@ -223,6 +272,13 @@ func (m *model) applyToolEvent(event toolEvent) {
 				break
 			}
 		}
+	case "denied":
+		m.toolCalls = append(m.toolCalls, toolCallRecord{
+			name:   event.Name,
+			args:   event.Args,
+			done:   true,
+			denied: true,
+		})
 	}
 }
 
@@ -294,6 +350,39 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
+		if len(m.confirmQueue) > 0 {
+			switch msg.String() {
+			case "ctrl+c":
+				for _, ev := range m.confirmQueue {
+					ev.Resp <- false
+				}
+				m.confirmQueue = nil
+				return m, tea.Quit
+			case "y":
+				ev := m.confirmQueue[0]
+				m.confirmQueue = m.confirmQueue[1:]
+				ev.Resp <- true
+			case "n":
+				ev := m.confirmQueue[0]
+				m.confirmQueue = m.confirmQueue[1:]
+				ev.Resp <- false
+			case "a":
+				ev := m.confirmQueue[0]
+				m.confirmQueue = m.confirmQueue[1:]
+				m.confirmState.mu.Lock()
+				m.confirmState.autoAllowed[ev.Name] = true
+				m.confirmState.mu.Unlock()
+				ev.Resp <- true
+			default:
+				return m, nil // 其他按键全部忽略
+			}
+			m.refreshContent()
+			m.viewport.GotoBottom()
+			// 持续监听下一个确认
+			return m, readConfirmCmd(m.toolCtx, m.confirmCh)
+		}
+
+		// ── 正常模式 ──────────────────────────────────
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Quit
@@ -306,6 +395,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.PageDown()
 			return m, nil
 		}
+
+		// ── 确认请求到达 ────────────────────────────────
+	case toolConfirmReqMsg:
+		m.confirmQueue = append(m.confirmQueue, msg.event)
+		m.refreshContent()
+		m.viewport.GotoBottom()
+		return m, readConfirmCmd(m.toolCtx, m.confirmCh)
 
 	// ── 工具事件 ───────────────────────────────────────
 	case toolEventMsg:
@@ -406,6 +502,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg.(type) {
 	case tea.MouseWheelMsg:
 		m.viewport, cmd = m.viewport.Update(msg)
+	case tea.KeyPressMsg:
+		m.textarea, cmd = m.textarea.Update(msg)
 	default:
 		m.textarea, cmd = m.textarea.Update(msg)
 	}
@@ -422,18 +520,27 @@ func (m *model) handleSend() (tea.Model, tea.Cmd) {
 	m.messages = append(m.messages, message{
 		role: roleUser, content: val, ts: time.Now(),
 	})
+
 	m.textarea.Reset()
 	m.thinking = true
 	m.thinkingStart = time.Now() // ← 记录起始时间
 	m.toolCalls = nil            // 清理上一轮工具调用
+	m.confirmQueue = nil
 	m.toolCtx, m.toolCancel = context.WithCancel(m.ctx)
+
 	m.refreshContent()
 	m.viewport.GotoBottom()
-	return m, tea.Batch(
+
+	cmds := []tea.Cmd{
 		thinkingTick(),
 		m.fetchAIResponse(val),
-		readToolEventCmd(m.toolCtx, m.toolEvents), // ← 启动轮询
-	)
+		readToolEventCmd(m.toolCtx, m.toolEvents),
+	}
+	// safe 模式才启动确认监听
+	if m.mode == "safe" {
+		cmds = append(cmds, readConfirmCmd(m.toolCtx, m.confirmCh))
+	}
+	return m, tea.Batch(cmds...)
 }
 
 // ── Layout ─────────────────────────────────────────────────────────────
@@ -488,26 +595,67 @@ func (m *model) refreshContent() {
 		return
 	}
 	var sections []string
+	hasActive := len(m.toolCalls) > 0 || len(m.confirmQueue) > 0
+
 	for i, msg := range m.messages {
-		// 流式输出期间，活跃工具调用插到最后一条 AI 消息之前
-		if m.streaming && len(m.toolCalls) > 0 &&
+		// 流式期间：活跃工具 + 确认插入到最后一条 AI 消息之前
+		if m.streaming && hasActive &&
 			i == len(m.messages)-1 && msg.role == roleAI {
-			for _, tc := range m.toolCalls {
-				sections = append(sections, m.renderToolCallLine(tc))
-			}
+			sections = append(sections, m.renderActiveSection()...)
 		}
 		sections = append(sections, m.renderMessage(msg))
 	}
-	// thinking 阶段（还没有 AI 消息时），工具调用追加在末尾
-	if !m.streaming && len(m.toolCalls) > 0 {
-		for _, tc := range m.toolCalls {
-			sections = append(sections, m.renderToolCallLine(tc))
-		}
+
+	// thinking 阶段（还没有 AI 消息）：追加在末尾
+	if !m.streaming && hasActive {
+		sections = append(sections, m.renderActiveSection()...)
 	}
+
 	if m.thinking {
 		sections = append(sections, m.renderThinking())
 	}
 	m.viewport.SetContent(lipgloss.JoinVertical(lipgloss.Left, sections...))
+}
+
+func (m *model) renderActiveSection() []string {
+	var lines []string
+	for _, tc := range m.toolCalls {
+		lines = append(lines, m.renderToolCallLine(tc))
+	}
+	for _, c := range m.confirmQueue {
+		lines = append(lines, m.renderConfirmLine(c))
+	}
+	return lines
+}
+
+func (m model) renderConfirmLine(event toolConfirmEvent) string {
+	var icon string
+
+	if event.Permission == tools.PermDangerous {
+		icon = "⚠"
+	} else {
+		icon = "⚡"
+	}
+
+	var nameStyle lipgloss.Style
+	if event.Permission == tools.PermDangerous {
+		nameStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#F38BA8")).Bold(true)
+	} else {
+		nameStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#F9E2AF")).Bold(true)
+	}
+
+	iconS := nameStyle.Render(icon) // 图标和名字用同样的颜色和加粗
+	nameS := nameStyle.Render(event.Name)
+	argsS := dimStyle.Render(formatArgsBrief(event.Args))
+
+	yS := lipgloss.NewStyle().Foreground(cGreen).Bold(true).Render("y")
+	nS := lipgloss.NewStyle().Foreground(lipgloss.Color("#F38BA8")).Bold(true).Render("n")
+	aS := lipgloss.NewStyle().Foreground(cMauve).Bold(true).Render("a")
+	hintS := lipgloss.NewStyle().Foreground(cOverlay0).Render(
+		fmt.Sprintf("[%s]es [%s]kip [%s]llow", yS, nS, aS),
+	)
+
+	return fmt.Sprintf("  %s %s %s  %s", iconS, nameS, argsS, hintS)
 }
 
 func (m model) renderMessage(msg message) string {
@@ -542,37 +690,41 @@ func (m model) renderToolCallsSection(toolCalls []toolCallRecord) string {
 func (m model) renderToolCallLine(tc toolCallRecord) string {
 	var icon string
 	var elapsed time.Duration
+	var nameSt lipgloss.Style
 
-	if tc.done {
+	switch {
+	case tc.denied:
+		icon = "⊘"
+		nameSt = lipgloss.NewStyle().Foreground(cSurface1)
+		elapsed = 0
+	case tc.done:
 		elapsed = tc.duration
 		if tc.isError {
 			icon = "✗"
+			nameSt = lipgloss.NewStyle().Foreground(lipgloss.Color("#F38BA8"))
 		} else {
 			icon = "✓"
+			nameSt = lipgloss.NewStyle().Foreground(cGreen)
 		}
-	} else {
+	default:
 		elapsed = time.Since(tc.startTime)
 		frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 		icon = frames[int(elapsed.Milliseconds()/100)%len(frames)]
+		nameSt = lipgloss.NewStyle().Foreground(cMauve)
 	}
 
-	var nameStyle lipgloss.Style
-	if tc.done {
-		if tc.isError {
-			nameStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#F38BA8"))
-		} else {
-			nameStyle = lipgloss.NewStyle().Foreground(cGreen)
-		}
+	iconS := nameSt.Render(icon)
+	nameS := nameSt.Render(tc.name)
+	argsS := dimStyle.Render(formatArgsBrief(tc.args))
+
+	var timeS string
+	if tc.denied {
+		timeS = dimStyle.Render("denied")
 	} else {
-		nameStyle = lipgloss.NewStyle().Foreground(cMauve)
+		timeS = tsStyle.Render(formatDuration(elapsed))
 	}
 
-	iconStr := nameStyle.Render(icon)
-	nameStr := nameStyle.Render(tc.name)
-	argsStr := dimStyle.Render(formatArgsBrief(tc.args))
-	timeStr := tsStyle.Render(formatDuration(elapsed))
-
-	return fmt.Sprintf("  %s %s%s  %s", iconStr, nameStr, argsStr, timeStr)
+	return fmt.Sprintf("  %s %s%s  %s", iconS, nameS, argsS, timeS)
 }
 
 // contentWidth 返回 viewport 内容区宽度（减去 gutter）
@@ -703,13 +855,58 @@ func (m model) View() tea.View {
 
 func UI(ctx context.Context, manager *worker.Manager) {
 	toolCh := make(chan toolEvent, 64)
+	confirmCh := make(chan toolConfirmEvent, 4)
+	state := &confirmState{autoAllowed: make(map[string]bool)}
+	mode := "safe"
+	if m := manager.GetMode(); m != "" {
+		mode = m
+	}
 
-	// ── 注册钩子 ──
 	if registry := manager.GetRegistry(); registry != nil {
+		// ── beforeExecute：权限检查 + 确认 ──
 		registry.AddBeforeExecuteHook(func(ctx context.Context, toolName string, args map[string]any) error {
+			if mode != "safe" {
+				// auto 模式直接放行
+				toolCh <- toolEvent{Phase: "before", Name: toolName, Args: args}
+				return nil
+			}
+
+			// 检查白名单
+			state.mu.Lock()
+			autoAllowed := state.autoAllowed[toolName]
+			state.mu.Unlock()
+
+			// 检查权限级别
+			tool, ok := registry.Get(toolName)
+			needsConfirm := ok &&
+				tool.Metadata.Permission != tools.PermReadOnly &&
+				!autoAllowed
+
+			if !needsConfirm {
+				toolCh <- toolEvent{Phase: "before", Name: toolName, Args: args}
+				return nil
+			}
+
+			// 需要确认 → 发送到 TUI，阻塞等响应
+			resp := make(chan bool, 1)
+			confirmCh <- toolConfirmEvent{
+				Name:       toolName,
+				Args:       args,
+				Permission: tool.Metadata.Permission,
+				Resp:       resp,
+			}
+
+			if !<-resp {
+				toolCh <- toolEvent{Phase: "denied", Name: toolName, Args: args}
+				return fmt.Errorf("operation denied by user")
+			}
+
+			// 确认通过
 			toolCh <- toolEvent{Phase: "before", Name: toolName, Args: args}
 			return nil
 		})
+
+		// ── afterExecute：记录结果 ──
 		registry.AddAfterExecuteHook(func(ctx context.Context, toolName string, result schema.ToolResult, duration time.Duration) {
 			toolCh <- toolEvent{
 				Phase:    "after",
@@ -720,7 +917,7 @@ func UI(ctx context.Context, manager *worker.Manager) {
 		})
 	}
 
-	m := initialModel(ctx, manager, toolCh)
+	m := initialModel(ctx, manager, toolCh, confirmCh, mode, state)
 	p := tea.NewProgram(m)
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

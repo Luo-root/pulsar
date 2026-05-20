@@ -67,3 +67,7 @@ func (m *Manager) GetWorker() *agent.Agent {
 func (m *Manager) GetRegistry() *tools.ToolRegistry {
 	return m.registry
 }
+
+func (m *Manager) GetMode() string {
+	return m.config.Worker.Mode
+}

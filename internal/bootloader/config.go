@@ -3,6 +3,7 @@ package bootloader
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -70,6 +71,7 @@ type Memory struct {
 type Worker struct {
 	SessionID     string `yaml:"session_id"`
 	MaxToolRounds int    `yaml:"max_tool_rounds"`
+	Mode          string `yaml:"mode"` // "safe" | "auto"
 }
 
 // SaveConfig 将配置保存到文件
@@ -113,6 +115,7 @@ func SaveConfig(config *Config, filePath string) error {
 	// Worker 配置
 	config.Worker.SessionID = "default"
 	config.Worker.MaxToolRounds = 50
+	config.Worker.Mode = "safe"
 
 	// 创建 memory.db（空文件）
 	if _, err := os.OpenFile(config.Memory.Path, os.O_CREATE|os.O_WRONLY, 0644); err != nil {
@@ -177,36 +180,66 @@ func LoadConfig(filePath string) (*Config, error) {
 
 // validateConfig 验证配置的完整性
 func validateConfig(config *Config) error {
+	// 1. API 配置校验
 	if config.API.BaseURL == "" {
-		return errors.New("missing base_url")
+		return errors.New("missing api.base_url")
+	}
+	// 校验 URL 格式
+	if _, err := url.ParseRequestURI(config.API.BaseURL); err != nil {
+		return fmt.Errorf("invalid api.base_url format: %w", err)
 	}
 
 	if config.API.APIKey == "" {
-		return errors.New("missing api_key")
+		return errors.New("missing api.api_key")
 	}
 
+	// 校验 API 风格
+	validStyles := map[string]bool{"openai": true, "anthropic": true}
+	if !validStyles[config.API.Style] {
+		return fmt.Errorf("invalid api.style: '%s' (must be 'openai' or 'anthropic')", config.API.Style)
+	}
+
+	// 2. Model 配置校验
 	if config.Model.Vendor == "" {
-		return errors.New("missing vendor")
+		return errors.New("missing model.vendor")
 	}
-
 	if config.Model.ModelID == "" {
-		return errors.New("missing model_id")
+		return errors.New("missing model.model_id")
 	}
 
+	// 3. Embedding 配置校验
 	if config.Embedding.BaseURL == "" {
 		return errors.New("missing embedding.base_url")
 	}
-
 	if config.Embedding.ModelID == "" {
 		return errors.New("missing embedding.model_id")
 	}
-
-	if config.Embedding.EmbeddingDimension == 0 {
-		return errors.New("missing embedding.embedding_dimension")
+	if config.Embedding.EmbeddingDimension <= 0 {
+		return errors.New("embedding.embedding_dimension must be greater than 0")
+	}
+	if config.Embedding.ChunkSize <= 0 {
+		return errors.New("embedding.chunk_size must be greater than 0")
 	}
 
-	if config.Embedding.ChunkSize == 0 {
-		return errors.New("missing embedding.chunk_size")
+	// 4. Worker 配置校验
+	if config.Worker.Mode == "" {
+		return errors.New("missing worker.mode")
+	}
+	// 校验 Worker 模式（假设支持 safe, aggressive, auto 等）
+	validModes := map[string]bool{"safe": true, "auto": true}
+	if !validModes[config.Worker.Mode] {
+		return fmt.Errorf("invalid worker.mode: '%s'", config.Worker.Mode)
+	}
+	if config.Worker.MaxToolRounds <= 0 {
+		return errors.New("worker.max_tool_rounds must be greater than 0")
+	}
+
+	// 5. Memory 配置校验
+	if config.Memory.MaxHistoryMessages < 0 {
+		return errors.New("memory.max_history_messages cannot be negative")
+	}
+	if config.Memory.ReserveTokens < 0 {
+		return errors.New("memory.reserve_tokens cannot be negative")
 	}
 
 	return nil
