@@ -1,6 +1,6 @@
 # Pulse-TUI
 
-一个基于 Go 和 Charm Bubble Tea v2 构建的终端 AI 聊天界面，支持多厂商大语言模型、工具调用、MCP 协议和对话记忆。
+一个基于 Go 和 Charm Bubble Tea v2 构建的终端 AI 聊天界面，支持多厂商大语言模型、工具调用、MCP 协议、对话记忆和智能规划执行。
 
 ## ✨ 特性
 
@@ -11,7 +11,9 @@
 - **MCP 协议**：支持 Model Context Protocol，可连接外部工具服务
 - **对话记忆**：基于 SQLite 的长期记忆存储，支持向量嵌入检索
 - **技能系统**：可加载自定义技能（Skill）扩展 AI 能力
-- **精美界面**：采用 Catppuccin Mocha 配色方案，气泡式聊天界面
+- **智能规划**：支持目标导向的任务规划与自动执行，包含失败重试和重规划机制
+- **斜杠命令**：支持 `/search`、`/help`、`/plan` 等命令扩展
+- **精美界面**：采用 Catppuccin Mocha 配色方案，气泡式聊天界面，支持行号显示
 
 ## 📁 项目结构
 
@@ -24,6 +26,13 @@ pulse-tui/
 │   │   ├── bootloader.go    # TUI 初始化向导
 │   │   ├── config.go        # 配置管理（YAML）
 │   │   └── model_list.go    # 模型列表获取
+│   ├── commands/            # 斜杠命令系统
+│   │   ├── registry.go      # 命令注册中心
+│   │   ├── help.go          # /help 命令
+│   │   ├── search.go        # /search 命令
+│   │   └── plan.go          # /plan 命令与计划渲染
+│   ├── planner/             # 智能规划执行器
+│   │   └── runner.go        # 规划与执行工作流
 │   ├── view/
 │   │   └── main_view.go     # 主聊天界面
 │   └── worker/
@@ -39,6 +48,11 @@ pulse-tui/
 │   ├── system_prompt.md     # 核心身份与行为准则
 │   ├── rules.md             # 工作目录与工具调用规则
 │   └── safety.md            # 安全策略
+├── .pulse-tui/              # 运行时数据目录
+│   ├── config.yaml          # 用户配置文件
+│   ├── memory.db            # 对话记忆数据库
+│   ├── pulse-mcp.json       # MCP 服务配置
+│   └── skills/              # 自定义技能目录
 ├── go.mod                   # Go 模块定义
 ├── go.sum                   # 依赖校验
 └── README.md                # 本文件
@@ -123,16 +137,45 @@ worker:
 | 快捷键 | 功能 |
 |--------|------|
 | `Ctrl+S` | 发送消息 |
+| `Ctrl+L` | 清空对话历史 |
+| `Ctrl+T` | 切换显示所有工具调用 |
+| `F1` | 显示/隐藏帮助面板 |
 | `PageUp` | 向上滚动 |
 | `PageDown` | 向下滚动 |
+| `Esc` | 关闭帮助面板 |
 | `Ctrl+C` | 退出程序 |
+
+### 斜杠命令
+
+Pulse-TUI 支持以下斜杠命令：
+
+| 命令 | 别名 | 用法 | 描述 |
+|------|------|------|------|
+| `/search` | `/find`, `/grep` | `/search <query>` | 搜索对话历史记录 |
+| `/help` | `/h`, `/?` | `/help` | 显示可用命令列表 |
+| `/plan` | `/p` | `/plan <goal>` | 创建并执行智能任务计划 |
+
+### 智能规划功能
+
+使用 `/plan` 命令可以创建目标导向的任务计划：
+
+```
+/plan 创建一个计算器应用
+```
+
+规划功能包含：
+- **自动任务分解**：AI 自动分析目标并分解为可执行的任务
+- **依赖关系管理**：自动处理任务间的依赖关系
+- **并行执行**：独立任务可并行执行以提高效率
+- **失败重试**：任务失败时自动重规划，最多重试 3 次
+- **实时进度**：显示任务执行状态、进度条和详细信息
 
 ### 工具调用确认（Safe 模式）
 
 当 AI 需要执行工具时，会显示确认提示：
 
 ```
-⚠ dangerous_tool(args)  [y]es [n]kip [a]llow
+⚠ dangerous_tool(args)  [y]es [n]ip [a]llow
 ```
 
 - **y**：允许本次执行
@@ -144,6 +187,14 @@ worker:
 - **safe 模式**：每次执行非只读工具前需要用户确认
 - **auto 模式**：自动执行所有工具，无需确认
 
+### 界面特性
+
+- **行号显示**：消息列表左侧显示行号，便于引用
+- **工具调用面板**：实时显示工具调用状态、参数和执行时间
+- **进度条**：计划执行时显示详细的进度信息
+- **Markdown 渲染**：AI 回复支持 Markdown 格式渲染
+- **动态动画**：思考和流式响应时显示动态加载动画
+
 ## 🏗️ 技术栈
 
 | 组件 | 用途 |
@@ -152,8 +203,31 @@ worker:
 | [Bubbles v2](https://github.com/charmbracelet/bubbles) | 文本输入、视口组件 |
 | [Lipgloss v2](https://github.com/charmbracelet/lipgloss) | 样式渲染 |
 | [Pulse](https://github.com/Luo-root/pulse) | AI Agent 核心框架 |
+| [Glamour](https://github.com/charmbracelet/glamour) | Markdown 渲染 |
 | GORM + SQLite | 数据持久化 |
 | Ollama | 本地嵌入模型 |
+
+## 🔧 开发说明
+
+### 构建依赖
+
+```bash
+# 更新依赖
+go mod tidy
+
+# 运行测试
+go test ./...
+
+# 构建并运行
+go run ./cmd/pulse-tui
+```
+
+### 扩展功能
+
+1. **添加新命令**：在 `internal/commands/` 目录下创建新文件，实现 `Command` 结构体
+2. **自定义技能**：在 `.pulse-tui/skills/` 目录下添加技能文件
+3. **扩展工具**：在 `internal/worker/tool_registry.go` 中注册新工具
+4. **修改界面**：编辑 `internal/view/main_view.go` 中的样式和布局
 
 ## 📄 许可证
 
@@ -163,3 +237,4 @@ worker:
 
 - [Charm](https://charm.sh/) 团队提供的优秀 TUI 工具链
 - [Pulse](https://github.com/Luo-root/pulse) 框架提供 AI Agent 能力
+- [Catppuccin](https://github.com/catppuccin) 提供的精美配色方案

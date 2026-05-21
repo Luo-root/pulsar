@@ -11,11 +11,14 @@ import (
 
 // ── Content rendering ──────────────────────────────────────────────────
 
+// ── 活跃工具调用区域（执行中的工具 + 待确认弹窗）──────────────
+
 func (m *model) renderActiveSection() []string {
 	var lines []string
-	for _, tc := range m.toolCalls {
-		lines = append(lines, m.renderToolCallLine(tc))
+	if len(m.toolCalls) > 0 {
+		lines = append(lines, m.renderToolCallsList(m.toolCalls))
 	}
+	// 确认弹窗始终逐条显示，不折叠
 	for _, c := range m.confirmQueue {
 		lines = append(lines, m.renderConfirmLine(c))
 	}
@@ -74,16 +77,77 @@ func (m model) renderMessage(msg message) string {
 // ── 历史工具调用（已完成）─────────────────────────────────
 
 func (m model) renderToolCallsSection(toolCalls []toolCallRecord) string {
-	var lines []string
-	for _, tc := range toolCalls {
-		lines = append(lines, m.renderToolCallLine(tc))
-	}
-	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+	return m.renderToolCallsList(toolCalls)
 }
 
-// ── 单条工具调用（通用：进行中 / 完成 / 出错）───────────
+// ── 工具调用列表（核心：折叠/展开逻辑）─────────────────────────
 
-func (m model) renderToolCallLine(tc toolCallRecord) string {
+func (m model) renderToolCallsList(calls []toolCallRecord) string {
+	if len(calls) == 0 {
+		return ""
+	}
+
+	// 单条或展开模式：全部显示
+	if len(calls) == 1 || m.showAllToolCalls {
+		var lines []string
+		for _, tc := range calls {
+			lines = append(lines, m.renderToolCallLine(tc))
+		}
+		// 展开模式下显示收起提示
+		if m.showAllToolCalls && len(calls) > 1 {
+			lines = append(lines, dimStyle.Render("      Ctrl+T collapse"))
+		}
+		return lipgloss.JoinVertical(lipgloss.Left, lines...)
+	}
+
+	// 折叠模式：摘要 + 最新一条
+	return m.renderCollapsedToolCalls(calls)
+}
+
+func (m model) renderCollapsedToolCalls(calls []toolCallRecord) string {
+	done, failed, denied, running := 0, 0, 0, 0
+	for _, tc := range calls {
+		switch {
+		case tc.denied:
+			denied++
+		case tc.done && tc.isError:
+			failed++
+		case tc.done:
+			done++
+		default:
+			running++
+		}
+	}
+
+	var parts []string
+	if done > 0 {
+		parts = append(parts, lipgloss.NewStyle().Foreground(cGreen).Render(fmt.Sprintf("%d ✓", done)))
+	}
+	if failed > 0 {
+		parts = append(parts, lipgloss.NewStyle().Foreground(lipgloss.Color("#F38BA8")).Render(fmt.Sprintf("%d ✗", failed)))
+	}
+	if denied > 0 {
+		parts = append(parts, dimStyle.Render(fmt.Sprintf("%d ⊘", denied)))
+	}
+	if running > 0 {
+		parts = append(parts, lipgloss.NewStyle().Foreground(cMauve).Render("running"))
+	}
+
+	countS := dimStyle.Render(fmt.Sprintf("%d", len(calls)))
+	statusS := strings.Join(parts, " ")
+	hintS := dimStyle.Render("Ctrl+T")
+
+	summaryLine := fmt.Sprintf("  %s tools: %s  %s", countS, statusS, hintS)
+
+	latest := calls[len(calls)-1]
+	latestLine := "    └─ " + m.toolCallContent(latest)
+
+	return lipgloss.JoinVertical(lipgloss.Left, summaryLine, latestLine)
+}
+
+// ── 单条工具调用渲染（公共逻辑）────────────────────────────────
+
+func (m model) toolCallContent(tc toolCallRecord) string {
 	var icon string
 	var elapsed time.Duration
 	var nameSt lipgloss.Style
@@ -120,7 +184,11 @@ func (m model) renderToolCallLine(tc toolCallRecord) string {
 		timeS = tsStyle.Render(formatDuration(elapsed))
 	}
 
-	return fmt.Sprintf("  %s %s%s  %s", iconS, nameS, argsS, timeS)
+	return fmt.Sprintf("%s %s%s  %s", iconS, nameS, argsS, timeS)
+}
+
+func (m model) renderToolCallLine(tc toolCallRecord) string {
+	return "  " + m.toolCallContent(tc)
 }
 
 func (m model) renderUserBubble(content string) string {

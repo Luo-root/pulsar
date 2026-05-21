@@ -8,6 +8,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 func (m *model) handleSend() (tea.Model, tea.Cmd) {
@@ -15,7 +16,7 @@ func (m *model) handleSend() (tea.Model, tea.Cmd) {
 	if val == "" || m.streaming || m.thinking {
 		return m, nil
 	}
-	m.textarea.Reset() // ← 先 reset，不管走哪条分支
+	m.textarea.Reset()
 
 	if m.planCompleted {
 		m.planCompleted = false
@@ -42,21 +43,40 @@ func (m *model) handleSend() (tea.Model, tea.Cmd) {
 		m.refreshContent()
 		m.viewport.GotoBottom()
 
-		// ★ 修复：/plan 命令需要启动 toolCtx + readToolEventCmd
-		cmds := []tea.Cmd{result.Command.Handler(result.Args)}
+		var cmds []tea.Cmd
+
+		// Plan 模式检查
 		if result.Command.Name == "plan" {
+			if m.mode != "auto" {
+				warnStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#F9E2AF"))
+				m.messages = append(m.messages, message{
+					role:    roleSystem,
+					content: warnStyle.Render("  ⚠ Plan works best in auto mode — tool confirmation prompts will interrupt task execution."),
+					ts:      time.Now(),
+				})
+				m.refreshContent()
+				m.viewport.GotoBottom()
+			}
+
+			// 启动 toolCtx + 事件监听
 			planCtx, planCancel := context.WithCancel(m.ctx)
 			m.toolCtx = planCtx
 			m.toolCancel = planCancel
-			cmds = append(cmds, readToolEventCmd(m.toolCtx, m.toolEvents))
+			cmds = append(cmds,
+				result.Command.Handler(result.Args),
+				readToolEventCmd(m.toolCtx, m.toolEvents),
+			)
 			if m.mode == "safe" {
 				cmds = append(cmds, readConfirmCmd(m.toolCtx, m.confirmCh))
 			}
+			return m, tea.Batch(cmds...)
 		}
+
+		cmds = append(cmds, result.Command.Handler(result.Args))
 		return m, tea.Batch(cmds...)
 	}
 
-	// ── 普通消息（只添加一次） ──
+	// ── 普通消息 ──
 	m.messages = append(m.messages, message{
 		role: roleUser, content: val, ts: time.Now(),
 	})

@@ -37,6 +37,7 @@ func (m model) getKeyGroups() []KeyGroup {
 			Name: "Chat",
 			Bindings: []KeyBinding{
 				{"Ctrl+S", "Send message"},
+				{"Ctrl+T", "Toggle tool calls"},
 			},
 		},
 		{
@@ -108,10 +109,10 @@ func (m model) footerHints() string {
 		return " y exec · n skip · a allow · ctrl+c quit "
 	}
 	if m.planActive {
-		return " F1 help · ctrl+c quit "
+		return " ctrl+t tools · F1 help · ctrl+c quit "
 	}
 	if m.streaming || m.thinking {
-		return " F1 help · ctrl+c quit "
+		return " ctrl+t tools · F1 help · ctrl+c quit "
 	}
 	return " F1 help · ctrl+s send · ctrl+c quit "
 }

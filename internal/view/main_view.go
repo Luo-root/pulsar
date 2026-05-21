@@ -199,10 +199,11 @@ type model struct {
 	streamCh      <-chan tea.Msg // ← 新增：流式数据通道
 
 	// ── 新增 ──
-	toolEvents chan toolEvent   // 钩子写入，TUI 读取
-	toolCalls  []toolCallRecord // 当前轮次活跃的工具调用
-	toolCtx    context.Context  // 用于取消 tool 事件轮询
-	toolCancel context.CancelFunc
+	toolEvents       chan toolEvent   // 钩子写入，TUI 读取
+	toolCalls        []toolCallRecord // 当前轮次活跃的工具调用
+	toolCtx          context.Context  // 用于取消 tool 事件轮询
+	toolCancel       context.CancelFunc
+	showAllToolCalls bool // false=只显示最新, true=显示全部
 
 	// ── 新增 ──
 	confirmCh    chan toolConfirmEvent // hook 写入确认请求
@@ -560,6 +561,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "ctrl+s":
 			return m.handleSend()
+		case "ctrl+t":
+			m.showAllToolCalls = !m.showAllToolCalls
+			m.refreshContent()
+			return m, nil
 		case "ctrl+l":
 			m.messages = nil
 			m.showHelp = false
