@@ -257,14 +257,42 @@ func (m model) renderWelcome() string {
 }
 
 // ── Header / Footer (pager border frame) ───────────────────────────────
+func (m model) renderModeBadge() string {
+	if m.mode == "auto" {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#A6E3A1")).Render("auto")
+	}
+	return lipgloss.NewStyle().Foreground(lipgloss.Color("#F9E2AF")).Render("safe")
+}
+
+func (m model) formatTokenCount() string {
+	n := m.manager.GetWorker().GetUsageTracker().GetStats().TotalTokens
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
+}
 
 func (m model) renderHeader() string {
 	title := titleStyle.Render("Pulse - TUI")
-	// ─ 颜色匹配边框，让 ├ 无缝连接
-	line := lipgloss.NewStyle().Foreground(cMauve).Render(
-		strings.Repeat("─", max(0, m.width-lipgloss.Width(title))),
+	titleW := lipgloss.Width(title)
+
+	// 状态信息：mode · tokens
+	modeS := m.renderModeBadge()
+	tokenS := lipgloss.NewStyle().Foreground(cSurface1).Render(
+		m.formatTokenCount() + " tok",
 	)
-	return lipgloss.JoinHorizontal(lipgloss.Center, title, line)
+	status := "\n " + modeS + lipgloss.NewStyle().Foreground(cOverlay0).Render(" · ") + tokenS + " "
+	statusW := lipgloss.Width(status)
+
+	// 连接线填满剩余宽度
+	lineW := max(0, m.width-titleW-statusW)
+	line := "\n" + lipgloss.NewStyle().Foreground(cMauve).Render(strings.Repeat("─", lineW))
+
+	return lipgloss.JoinHorizontal(lipgloss.Left, title, status, line)
 }
 
 func (m model) renderFooter() string {

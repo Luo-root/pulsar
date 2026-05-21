@@ -29,8 +29,9 @@ func (m model) getKeyGroups() []KeyGroup {
 			Name: "General",
 			Bindings: []KeyBinding{
 				{"F1", "Toggle help"},
-				{"Ctrl+C", "Quit"},
+				{"Ctrl+C", "Quit / Cancel plan"},
 				{"Ctrl+L", "Clear conversation"},
+				{"Ctrl+E", "Toggle mode"},
 			},
 		},
 		{
@@ -106,13 +107,16 @@ func (m model) renderHelp() string {
 
 func (m model) footerHints() string {
 	if len(m.confirmQueue) > 0 {
+		if m.planActive {
+			return " y exec · n skip · a allow · ctrl+c cancel "
+		}
 		return " y exec · n skip · a allow · ctrl+c quit "
 	}
 	if m.planActive {
-		return " ctrl+t tools · F1 help · ctrl+c quit "
+		return " ctrl+t tools · ctrl+e mode · ctrl+c cancel "
 	}
 	if m.streaming || m.thinking {
 		return " ctrl+t tools · F1 help · ctrl+c quit "
 	}
-	return " F1 help · ctrl+s send · ctrl+c quit "
+	return " F1 help · ctrl+s send · ctrl+t tools · ctrl+e mode · ctrl+c quit "
 }

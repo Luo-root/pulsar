@@ -143,6 +143,8 @@ type planTickMsg struct{}
 
 type planDoneMsg struct{}
 
+type streamTokensMsg struct{ tokens int64 }
+
 // ── Tool call types ────────────────────────────────────────────────────
 
 type toolEvent struct {
@@ -172,6 +174,7 @@ type toolConfirmReqMsg struct {
 type confirmState struct {
 	mu          sync.Mutex
 	autoAllowed map[string]bool
+	mode        string
 }
 
 type toolCallRecord struct {
@@ -204,6 +207,7 @@ type model struct {
 	toolCtx          context.Context  // 用于取消 tool 事件轮询
 	toolCancel       context.CancelFunc
 	showAllToolCalls bool // false=只显示最新, true=显示全部
+	totalTokens      int64
 
 	// ── 新增 ──
 	confirmCh    chan toolConfirmEvent // hook 写入确认请求
@@ -498,7 +502,7 @@ func (m model) fetchAIResponse(userMsg string) tea.Cmd {
 		ch := make(chan tea.Msg, 64)
 		go func() {
 			defer close(ch)
-			_, err := m.manager.GetWorker().SendStream(
+			finalMsg, err := m.manager.GetWorker().SendStream(
 				m.ctx, userMsg,
 				func(msg *schema.Message, isToolCall bool) bool {
 					if msg != nil && !isToolCall && msg.Content != "" {
@@ -509,8 +513,12 @@ func (m model) fetchAIResponse(userMsg string) tea.Cmd {
 			)
 			if err != nil {
 				ch <- streamErrMsg{err: err}
+				return
 			}
 			// close(ch) 由 defer 处理，readNextCmd 收到 ok=false 时发 streamDoneMsg
+			if finalMsg != nil && finalMsg.Usage != nil && finalMsg.Usage.TotalTokens > 0 {
+				ch <- streamTokensMsg{tokens: int64(finalMsg.Usage.TotalTokens)}
+			}
 		}()
 		return streamStartMsg{ch: ch}
 	}
@@ -530,6 +538,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					ev.Resp <- false
 				}
 				m.confirmQueue = nil
+				// plan 活跃时只取消 plan，不退出
+				if m.planActive && m.planCancel != nil {
+					m.planCancel()
+					return m, nil
+				}
 				return m, tea.Quit
 			case "y":
 				ev := m.confirmQueue[0]
@@ -558,13 +571,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// ── 正常模式 ──────────────────────────────────
 		switch msg.String() {
 		case "ctrl+c":
+			if m.planActive {
+				if m.planCancel != nil {
+					m.planCancel()
+				}
+				return m, nil
+			}
 			return m, tea.Quit
+
 		case "ctrl+s":
 			return m.handleSend()
+
 		case "ctrl+t":
 			m.showAllToolCalls = !m.showAllToolCalls
 			m.refreshContent()
 			return m, nil
+
 		case "ctrl+l":
 			m.messages = nil
 			m.showHelp = false
@@ -572,6 +594,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.planView = nil        // ← 新增
 			m.refreshContent()
 			return m, nil
+
+		case "ctrl+e":
+			m.confirmState.mu.Lock()
+			if m.confirmState.mode == "safe" {
+				m.confirmState.mode = "auto"
+				m.mode = "auto"
+			} else {
+				m.confirmState.mode = "safe"
+				m.mode = "safe"
+			}
+			m.confirmState.mu.Unlock()
+			m.refreshContent()
+			return m, nil
+
 		case "f1":
 			m.showHelp = !m.showHelp
 			if m.showHelp {
@@ -636,6 +672,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 流已启动，保存 channel，开始读第一个 chunk
 		// thinking 动画保持，等到第一个 chunk 到达再停止
 		m.streamCh = msg.ch
+		return m, readNextCmd(m.streamCh)
+
+	case streamTokensMsg:
 		return m, readNextCmd(m.streamCh)
 
 	case streamChunkMsg:
@@ -929,16 +968,21 @@ func (m model) View() tea.View {
 func UI(ctx context.Context, manager *worker.Manager) {
 	toolCh := make(chan toolEvent, 64)
 	confirmCh := make(chan toolConfirmEvent, 4)
-	state := &confirmState{autoAllowed: make(map[string]bool)}
 	mode := "safe"
 	if m := manager.GetMode(); m != "" {
 		mode = m
 	}
 
+	// mode 写入 confirmState，与 hook 共享
+	state := &confirmState{autoAllowed: make(map[string]bool), mode: mode}
+
 	if registry := manager.GetRegistry(); registry != nil {
 		// ── beforeExecute：权限检查 + 确认 ──
 		registry.AddBeforeExecuteHook(func(ctx context.Context, toolName string, args map[string]any) error {
-			if mode != "safe" {
+			state.mu.Lock()
+			currentMode := state.mode
+			state.mu.Unlock()
+			if currentMode != "safe" {
 				// auto 模式直接放行
 				select {
 				case toolCh <- toolEvent{Phase: "before", Name: toolName, Args: args}:
