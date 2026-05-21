@@ -107,6 +107,9 @@ func (m model) footerHints() string {
 	if len(m.confirmQueue) > 0 {
 		return " y exec · n skip · a allow · ctrl+c quit "
 	}
+	if m.planActive {
+		return " F1 help · ctrl+c quit "
+	}
 	if m.streaming || m.thinking {
 		return " F1 help · ctrl+c quit "
 	}

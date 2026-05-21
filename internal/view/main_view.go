@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"pulse-tui/internal/commands"
+	"pulse-tui/internal/planner"
 	"pulse-tui/internal/worker"
 	"strings"
 	"sync"
@@ -13,6 +15,8 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/Luo-root/pulse/components/agent"
+	"github.com/Luo-root/pulse/components/flowchart/node"
 	"github.com/Luo-root/pulse/components/schema"
 	"github.com/Luo-root/pulse/components/tools"
 	"github.com/charmbracelet/glamour"
@@ -92,6 +96,7 @@ type role int
 const (
 	roleUser role = iota
 	roleAI
+	roleSystem // ← 新增
 )
 
 type message struct {
@@ -102,11 +107,41 @@ type message struct {
 	renderedContent string
 }
 
+// indexedMessage 包装 message 带上索引，供 /search 使用
+type indexedMessage struct {
+	message
+	index int
+}
+
+func (im indexedMessage) Role() string {
+	switch im.role {
+	case roleUser:
+		return "You"
+	case roleAI:
+		return "AI"
+	case roleSystem:
+		return "System"
+	}
+	return ""
+}
+func (im indexedMessage) Content() string { return im.content }
+func (im indexedMessage) Time() time.Time { return im.ts }
+func (im indexedMessage) Index() int      { return im.index }
+
 type thinkingTickMsg struct{}
 type streamStartMsg struct{ ch <-chan tea.Msg }
 type streamChunkMsg struct{ delta string }
 type streamDoneMsg struct{}
 type streamErrMsg struct{ err error }
+
+type planStartedMsg struct {
+	ch     <-chan commands.PlanUpdateMsg
+	cancel context.CancelFunc
+}
+
+type planTickMsg struct{}
+
+type planDoneMsg struct{}
 
 // ── Tool call types ────────────────────────────────────────────────────
 
@@ -180,6 +215,20 @@ type model struct {
 	manager   *worker.Manager
 	ctx       context.Context
 	gRenderer *glamour.TermRenderer
+	commands  *commands.Registry
+
+	// ── Plan execution ──
+	planActive    bool
+	planCompleted bool
+	planView      *commands.PlanView
+	planPhase     commands.PlanPhase
+	planMessage   string
+	planCh        <-chan commands.PlanUpdateMsg
+	planStart     time.Time
+	planTick      int
+	planCancel    context.CancelFunc
+	planningAgent agent.AgentInterface // 规划用（无工具）
+	taskAgent     agent.AgentInterface // 执行用（带工具）
 }
 
 func initialModel(
@@ -189,6 +238,8 @@ func initialModel(
 	confirmCh chan toolConfirmEvent,
 	mode string,
 	confirmSt *confirmState,
+	planningAgent agent.AgentInterface,
+	taskAgent agent.AgentInterface,
 ) model {
 	ta := textarea.New()
 	ta.Placeholder = "Send a message... (Ctrl+S to send)"
@@ -204,19 +255,135 @@ func initialModel(
 	s.Focused.CursorLine = lipgloss.NewStyle()
 	ta.SetStyles(s)
 
+	reg := commands.NewRegistry()
+	reg.Register(commands.NewSearchCommand())
+	reg.Register(commands.NewHelpCommand(reg))
+	reg.Register(commands.NewPlanCommand())
+
 	return model{
-		textarea:     ta,
-		manager:      manager,
-		ctx:          ctx,
-		toolEvents:   toolEvents,
-		confirmCh:    confirmCh,
-		confirmState: confirmSt,
-		mode:         mode,
+		textarea:      ta,
+		manager:       manager,
+		ctx:           ctx,
+		toolEvents:    toolEvents,
+		confirmCh:     confirmCh,
+		confirmState:  confirmSt,
+		mode:          mode,
+		commands:      reg,
+		planningAgent: planningAgent,
+		taskAgent:     taskAgent,
 	}
 }
 
 func (m model) Init() tea.Cmd {
 	return tea.Batch(textarea.Blink, tea.RequestBackgroundColor)
+}
+
+// ── Plan helpers ───────────────────────────────────────────────────────
+
+// planToView 将 node.Plan 转换为 commands.PlanView（视图模型，与 node 解耦）
+func planToView(p *node.Plan) *commands.PlanView {
+	if p == nil {
+		return nil
+	}
+	plan := p.Snapshot()
+	v := &commands.PlanView{Goal: plan.Goal}
+	for _, t := range plan.Tasks {
+		v.Tasks = append(v.Tasks, commands.TaskView{
+			ID:          t.ID,
+			Description: t.Description,
+			Inputs:      t.Inputs,
+			Outputs:     t.Outputs,
+			State:       commands.PlanTaskState(t.State),
+			Error:       t.Error,
+		})
+	}
+	return v
+}
+
+func planTickCmd() tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
+		return planTickMsg{}
+	})
+}
+
+// ── Plan execution methods ─────────────────────────────────────────────
+
+func (m *model) handlePlanRequest(goal string) (tea.Model, tea.Cmd) {
+	if m.planActive {
+		m.messages = append(m.messages, message{
+			role: roleSystem, content: "A plan is already running.", ts: time.Now(),
+		})
+		m.refreshContent()
+		m.viewport.GotoBottom()
+		return m, nil
+	}
+
+	m.planActive = true
+	m.planCompleted = false
+	m.planView = nil
+	m.planPhase = commands.PlanPhasePlanning
+	m.planMessage = "正在分析目标..."
+	m.planStart = time.Now()
+	m.planTick = 0
+
+	m.refreshContent()
+	m.viewport.GotoBottom()
+
+	return m, tea.Batch(m.launchPlan(goal), planTickCmd())
+}
+
+func (m model) launchPlan(goal string) tea.Cmd {
+	return func() tea.Msg {
+		ch := make(chan commands.PlanUpdateMsg, 64)
+		ctx, cancel := context.WithCancel(m.ctx)
+
+		go func() {
+			defer cancel()
+			defer close(ch)
+			defer func() {
+				if r := recover(); r != nil {
+					ch <- commands.PlanUpdateMsg{
+						Phase:   commands.PlanPhaseFailed,
+						Message: fmt.Sprintf("Plan panicked: %v", r),
+					}
+				}
+			}()
+
+			planner.RunPlan(ctx, goal, m.planningAgent, m.taskAgent, func(event planner.RunnerEvent) {
+				ch <- commands.PlanUpdateMsg{
+					Phase:   commands.PlanPhase(event.Phase),
+					Plan:    planToView(event.Plan),
+					Message: event.Message,
+				}
+			})
+		}()
+
+		return planStartedMsg{ch: ch, cancel: cancel}
+	}
+}
+
+func (m model) readPlanUpdateCmd() tea.Cmd {
+	ch := m.planCh
+	if ch == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		update, ok := <-ch
+		if !ok {
+			return planDoneMsg{}
+		}
+		return update
+	}
+}
+
+func (m model) renderPlanPanel() string {
+	msg := commands.PlanUpdateMsg{
+		Phase:   m.planPhase,
+		Plan:    m.planView,
+		Message: m.planMessage,
+	}
+	elapsed := time.Since(m.planStart)
+	return commands.RenderPlan(msg, m.contentWidth(), elapsed, m.planTick)
 }
 
 // ── Commands ───────────────────────────────────────────────────────────
@@ -396,6 +563,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+l":
 			m.messages = nil
 			m.showHelp = false
+			m.planCompleted = false // ← 新增
+			m.planView = nil        // ← 新增
 			m.refreshContent()
 			return m, nil
 		case "f1":
@@ -436,8 +605,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyToolEvent(msg.event)
 		m.refreshContent()
 		m.viewport.GotoBottom()
-		// 持续轮询（thinking 或 streaming 期间）
-		if m.thinking || m.streaming {
+		// ★ 持续轮询：thinking、streaming 或 plan 执行期间
+		if m.thinking || m.streaming || m.planActive {
 			return m, readToolEventCmd(m.toolCtx, m.toolEvents)
 		}
 		return m, nil
@@ -541,6 +710,76 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.refreshContent()
 		return m, nil
+
+	case commands.HelpMsg:
+		m.showHelp = false // 不走 showHelp 面板，走消息流
+		helpText := commands.RenderHelp(msg.Commands, m.contentWidth())
+		m.messages = append(m.messages, message{
+			role: roleSystem, content: helpText, ts: time.Now(),
+		})
+		m.refreshContent()
+		m.viewport.GotoBottom()
+		return m, nil
+
+	case commands.SearchRequestMsg:
+		return m.handleSearch(msg.Query)
+		// ── Plan execution ─────────────────────────────────────────────
+	case commands.PlanRequestMsg:
+		return m.handlePlanRequest(msg.Goal)
+
+	case planStartedMsg:
+		m.planCh = msg.ch
+		m.planCancel = msg.cancel
+		return m, m.readPlanUpdateCmd()
+
+	case commands.PlanUpdateMsg:
+		m.planPhase = msg.Phase
+		m.planView = msg.Plan
+		m.planMessage = msg.Message
+
+		if msg.Phase.IsTerminal() {
+			m.planActive = false
+			m.planCompleted = true
+			m.planCh = nil
+
+			// ★ 清理 toolCtx，停止 readToolEventCmd
+			if m.toolCancel != nil {
+				m.toolCancel()
+				m.toolCancel = nil
+			}
+			m.confirmQueue = nil
+
+			if msg.Message != "" {
+				m.messages = append(m.messages, message{
+					role: roleSystem, content: msg.Message, ts: time.Now(),
+				})
+			}
+		}
+
+		m.refreshContent()
+		m.viewport.GotoBottom()
+
+		if msg.Phase.IsTerminal() {
+			return m, nil
+		}
+		return m, m.readPlanUpdateCmd()
+
+	case planTickMsg:
+		if !m.planActive {
+			return m, nil
+		}
+		m.planTick++
+		m.refreshContent()
+		return m, planTickCmd()
+
+	case planDoneMsg:
+		if m.planActive {
+			m.planActive = false
+			m.planCompleted = true
+			m.planCh = nil
+			m.refreshContent()
+		}
+		return m, nil
 	}
 
 	var cmd tea.Cmd
@@ -554,37 +793,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	cmds = append(cmds, cmd)
 
-	return m, tea.Batch(cmds...)
-}
-
-func (m *model) handleSend() (tea.Model, tea.Cmd) {
-	val := strings.TrimSpace(m.textarea.Value())
-	if val == "" || m.streaming || m.thinking {
-		return m, nil // 流式进行中禁止重复发送
-	}
-	m.messages = append(m.messages, message{
-		role: roleUser, content: val, ts: time.Now(),
-	})
-
-	m.textarea.Reset()
-	m.thinking = true
-	m.thinkingStart = time.Now() // ← 记录起始时间
-	m.toolCalls = nil            // 清理上一轮工具调用
-	m.confirmQueue = nil
-	m.toolCtx, m.toolCancel = context.WithCancel(m.ctx)
-
-	m.refreshContent()
-	m.viewport.GotoBottom()
-
-	cmds := []tea.Cmd{
-		thinkingTick(),
-		m.fetchAIResponse(val),
-		readToolEventCmd(m.toolCtx, m.toolEvents),
-	}
-	// safe 模式才启动确认监听
-	if m.mode == "safe" {
-		cmds = append(cmds, readConfirmCmd(m.toolCtx, m.confirmCh))
-	}
 	return m, tea.Batch(cmds...)
 }
 
@@ -633,14 +841,10 @@ func (m *model) layout() {
 	}
 }
 
-// ── Content rendering ──────────────────────────────────────────────────
-
 func (m *model) refreshContent() {
 	if m.viewport.Width() == 0 {
 		return
 	}
-
-	// 帮助面板激活时，不覆盖
 	if m.showHelp {
 		m.viewport.SetContent(m.renderHelp())
 		return
@@ -650,15 +854,12 @@ func (m *model) refreshContent() {
 	hasActive := len(m.toolCalls) > 0 || len(m.confirmQueue) > 0
 
 	for i, msg := range m.messages {
-		// 流式期间：活跃工具 + 确认插入到最后一条 AI 消息之前
-		if m.streaming && hasActive &&
-			i == len(m.messages)-1 && msg.role == roleAI {
+		if m.streaming && hasActive && i == len(m.messages)-1 && msg.role == roleAI {
 			sections = append(sections, m.renderActiveSection()...)
 		}
 		sections = append(sections, m.renderMessage(msg))
 	}
 
-	// thinking 阶段（还没有 AI 消息）：追加在末尾
 	if !m.streaming && hasActive {
 		sections = append(sections, m.renderActiveSection()...)
 	}
@@ -666,216 +867,18 @@ func (m *model) refreshContent() {
 	if m.thinking {
 		sections = append(sections, m.renderThinking())
 	}
+
+	// ── Plan 面板放在消息列表之后 ──
+	if m.planActive || m.planCompleted {
+		sections = append(sections, m.renderPlanPanel())
+	}
+
 	m.viewport.SetContent(lipgloss.JoinVertical(lipgloss.Left, sections...))
-}
-
-func (m *model) renderActiveSection() []string {
-	var lines []string
-	for _, tc := range m.toolCalls {
-		lines = append(lines, m.renderToolCallLine(tc))
-	}
-	for _, c := range m.confirmQueue {
-		lines = append(lines, m.renderConfirmLine(c))
-	}
-	return lines
-}
-
-func (m model) renderConfirmLine(event toolConfirmEvent) string {
-	var icon string
-
-	if event.Permission == tools.PermDangerous {
-		icon = "⚠"
-	} else {
-		icon = "⚡"
-	}
-
-	var nameStyle lipgloss.Style
-	if event.Permission == tools.PermDangerous {
-		nameStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#F38BA8")).Bold(true)
-	} else {
-		nameStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#F9E2AF")).Bold(true)
-	}
-
-	iconS := nameStyle.Render(icon) // 图标和名字用同样的颜色和加粗
-	nameS := nameStyle.Render(event.Name)
-	argsS := dimStyle.Render(formatArgsBrief(event.Args))
-
-	yS := lipgloss.NewStyle().Foreground(cGreen).Bold(true).Render("y")
-	nS := lipgloss.NewStyle().Foreground(lipgloss.Color("#F38BA8")).Bold(true).Render("n")
-	aS := lipgloss.NewStyle().Foreground(cMauve).Bold(true).Render("a")
-	hintS := lipgloss.NewStyle().Foreground(cOverlay0).Render(
-		fmt.Sprintf("[%s]es [%s]kip [%s]llow", yS, nS, aS),
-	)
-
-	return fmt.Sprintf("  %s %s %s  %s", iconS, nameS, argsS, hintS)
-}
-
-func (m model) renderMessage(msg message) string {
-	var sections []string
-	switch msg.role {
-	case roleUser:
-		sections = append(sections, m.renderUserBubble(msg.content))
-	case roleAI:
-		if len(msg.toolCalls) > 0 {
-			sections = append(sections, m.renderToolCallsSection(msg.toolCalls))
-		}
-		sections = append(sections, m.renderAIBubble(msg.content, msg.renderedContent))
-	}
-	ts := tsStyle.Render("  " + msg.ts.Format("15:04"))
-	sections = append(sections, ts)
-	return lipgloss.JoinVertical(lipgloss.Left, sections...)
-}
-
-// ── 历史工具调用（已完成）─────────────────────────────────
-
-func (m model) renderToolCallsSection(toolCalls []toolCallRecord) string {
-	var lines []string
-	for _, tc := range toolCalls {
-		lines = append(lines, m.renderToolCallLine(tc))
-	}
-	return lipgloss.JoinVertical(lipgloss.Left, lines...)
-}
-
-// ── 单条工具调用（通用：进行中 / 完成 / 出错）───────────
-
-func (m model) renderToolCallLine(tc toolCallRecord) string {
-	var icon string
-	var elapsed time.Duration
-	var nameSt lipgloss.Style
-
-	switch {
-	case tc.denied:
-		icon = "⊘"
-		nameSt = lipgloss.NewStyle().Foreground(cSurface1)
-		elapsed = 0
-	case tc.done:
-		elapsed = tc.duration
-		if tc.isError {
-			icon = "✗"
-			nameSt = lipgloss.NewStyle().Foreground(lipgloss.Color("#F38BA8"))
-		} else {
-			icon = "✓"
-			nameSt = lipgloss.NewStyle().Foreground(cGreen)
-		}
-	default:
-		elapsed = time.Since(tc.startTime)
-		frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-		icon = frames[int(elapsed.Milliseconds()/100)%len(frames)]
-		nameSt = lipgloss.NewStyle().Foreground(cMauve)
-	}
-
-	iconS := nameSt.Render(icon)
-	nameS := nameSt.Render(tc.name)
-	argsS := dimStyle.Render(formatArgsBrief(tc.args))
-
-	var timeS string
-	if tc.denied {
-		timeS = dimStyle.Render("denied")
-	} else {
-		timeS = tsStyle.Render(formatDuration(elapsed))
-	}
-
-	return fmt.Sprintf("  %s %s%s  %s", iconS, nameS, argsS, timeS)
 }
 
 // contentWidth 返回 viewport 内容区宽度（减去 gutter）
 func (m model) contentWidth() int {
 	return max(10, m.viewport.Width()-gutterWidth)
-}
-
-func (m model) renderUserBubble(content string) string {
-	cw := m.contentWidth()
-	bubbleW := max(30, cw*65/100)
-	innerW := bubbleW - 4 // border(2) + padding(2)
-
-	rendered := lipgloss.NewStyle().
-		Width(innerW).Foreground(cText).Render(content)
-	bubble := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(cGreen).
-		Padding(0, 1).
-		Render(rendered)
-
-	// 外层 Width = 内容区宽度，Align(Right) 让气泡靠右
-	return lipgloss.NewStyle().
-		Width(cw).Align(lipgloss.Right).Render(bubble)
-}
-
-func (m model) renderAIBubble(content string, rendered string) string {
-	cw := m.contentWidth()
-	bubbleW := max(30, cw*75/100)
-	innerW := bubbleW - 4
-
-	var renderedContent string
-	if rendered != "" {
-		renderedContent = lipgloss.NewStyle().
-			Width(innerW).Render(rendered)
-	} else {
-		renderedContent = lipgloss.NewStyle().
-			Width(innerW).Foreground(cText).Render(content)
-	}
-
-	return lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(cMauve).
-		Padding(0, 1).
-		Render(renderedContent)
-}
-
-func (m model) renderThinking() string {
-	elapsed := time.Since(m.thinkingStart)
-	// 格式：秒数 < 60 显示 "X.Xs"，>= 60 显示 "Xm XXs"
-	var timeStr string
-	if elapsed < time.Minute {
-		timeStr = fmt.Sprintf("%.1fs", elapsed.Seconds())
-	} else {
-		timeStr = fmt.Sprintf("%dm%02ds", int(elapsed.Minutes()), int(elapsed.Seconds())%60)
-	}
-	// 动态跳动的光标符号
-	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-	frame := frames[int(elapsed.Milliseconds()/100)%len(frames)]
-	return dimStyle.Render(fmt.Sprintf("  %s Thinking  %s", frame, timeStr))
-}
-
-func (m model) renderWelcome() string {
-	icon := lipgloss.NewStyle().Foreground(cMauve).Bold(true).Render("✦")
-	title := lipgloss.NewStyle().Foreground(cText).Bold(true).Render("Pulse - TUI")
-	desc := dimStyle.Render("Type a message and press Ctrl+S to send.\nPageUp/PageDown to scroll.")
-	content := lipgloss.JoinVertical(lipgloss.Center, icon+" "+title, "", desc)
-	return lipgloss.Place(
-		m.viewport.Width(), m.viewport.Height(),
-		lipgloss.Center, lipgloss.Center, content,
-	)
-}
-
-// ── Header / Footer (pager border frame) ───────────────────────────────
-
-func (m model) renderHeader() string {
-	title := titleStyle.Render("Pulse - TUI")
-	// ─ 颜色匹配边框，让 ├ 无缝连接
-	line := lipgloss.NewStyle().Foreground(cMauve).Render(
-		strings.Repeat("─", max(0, m.width-lipgloss.Width(title))),
-	)
-	return lipgloss.JoinHorizontal(lipgloss.Center, title, line)
-}
-
-func (m model) renderFooter() string {
-	info := infoStyle.Render(fmt.Sprintf(
-		" %3.f%%:%3.f%% ",
-		m.viewport.ScrollPercent()*100,
-		m.viewport.HorizontalScrollPercent()*100,
-	))
-
-	hints := lipgloss.NewStyle().Foreground(cOverlay0).Render(m.footerHints())
-	hintsW := lipgloss.Width(hints)
-	infoW := lipgloss.Width(info)
-	lineW := max(0, m.width-hintsW-infoW)
-
-	line := "\n" + hints +
-		lipgloss.NewStyle().Foreground(cSurface1).Render(
-			strings.Repeat("─", lineW))
-
-	return lipgloss.JoinHorizontal(lipgloss.Left, line, info)
 }
 
 // ── View ───────────────────────────────────────────────────────────────
@@ -932,7 +935,10 @@ func UI(ctx context.Context, manager *worker.Manager) {
 		registry.AddBeforeExecuteHook(func(ctx context.Context, toolName string, args map[string]any) error {
 			if mode != "safe" {
 				// auto 模式直接放行
-				toolCh <- toolEvent{Phase: "before", Name: toolName, Args: args}
+				select {
+				case toolCh <- toolEvent{Phase: "before", Name: toolName, Args: args}:
+				default:
+				}
 				return nil
 			}
 
@@ -973,16 +979,20 @@ func UI(ctx context.Context, manager *worker.Manager) {
 
 		// ── afterExecute：记录结果 ──
 		registry.AddAfterExecuteHook(func(ctx context.Context, toolName string, result schema.ToolResult, duration time.Duration) {
-			toolCh <- toolEvent{
+			select {
+			case toolCh <- toolEvent{
 				Phase:    "after",
 				Name:     toolName,
 				IsError:  result.IsError,
 				Duration: duration,
+			}:
+			default:
 			}
 		})
 	}
 
-	m := initialModel(ctx, manager, toolCh, confirmCh, mode, state)
+	m := initialModel(ctx, manager, toolCh, confirmCh, mode, state, manager.DisposableWorker(), manager.GetWorker())
+
 	p := tea.NewProgram(m)
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
