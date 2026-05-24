@@ -662,6 +662,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+		if m.streaming {
+			needTick = true
+		}
 		if needTick {
 			m.refreshContent()
 			return m, thinkingTick()
@@ -680,10 +683,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamChunkMsg:
 		if !m.streaming {
 			m.streaming = true
-			m.thinking = false // ← thinking 动画到此停止
+			m.thinking = false
 			m.messages = append(m.messages, message{
 				role: roleAI, content: "", ts: time.Now(),
 			})
+			// streaming 开始时重新布局，因为 footer 高度变了
+			m.layout()
 		}
 		if len(m.messages) > 0 {
 			last := &m.messages[len(m.messages)-1]
@@ -697,10 +702,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case streamDoneMsg:
 		// 流结束
+		wasStreaming := m.streaming
 		m.streaming = false
 		m.streamCh = nil
-		m.toolCancel()      // 停止工具事件轮询
-		m.drainToolEvents() // 排空剩余事件
+		m.toolCancel()
+		m.drainToolEvents()
 		// 将工具调用记录附加到最后一条 AI 消息
 		if len(m.toolCalls) > 0 && len(m.messages) > 0 {
 			last := &m.messages[len(m.messages)-1]
@@ -718,6 +724,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// streaming 结束时重新布局，因为 footer 高度变了
+		if wasStreaming {
+			m.layout()
+		}
 		m.refreshContent()
 		m.viewport.GotoBottom()
 		return m, nil

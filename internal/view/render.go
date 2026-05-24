@@ -303,6 +303,7 @@ func (m model) renderFooter() string {
 	))
 
 	hints := lipgloss.NewStyle().Foreground(cOverlay0).Render(m.footerHints())
+
 	hintsW := lipgloss.Width(hints)
 	infoW := lipgloss.Width(info)
 	lineW := max(0, m.width-hintsW-infoW)
@@ -311,5 +312,57 @@ func (m model) renderFooter() string {
 		lipgloss.NewStyle().Foreground(cSurface1).Render(
 			strings.Repeat("─", lineW))
 
-	return lipgloss.JoinHorizontal(lipgloss.Left, line, info)
+	footer := lipgloss.JoinHorizontal(lipgloss.Left, line, info)
+
+	// 流式输出状态栏（在 footer 下方）
+	if m.streaming {
+		elapsed := time.Since(m.thinkingStart)
+
+		// 使用更明显的动画符号 - 方块渐变
+		frames := []string{"▏", "▎", "▍", "▌", "▋", "▊", "▉", "█", "▉", "▊", "▋", "▌", "▍", "▎", "▏"}
+		frame := frames[int(elapsed.Milliseconds()/60)%len(frames)]
+
+		// 显示响应时间
+		var timeIndicator string
+		if elapsed < time.Second {
+			timeIndicator = fmt.Sprintf("%dms", elapsed.Milliseconds())
+		} else {
+			timeIndicator = fmt.Sprintf("%.1fs", elapsed.Seconds())
+		}
+
+		// 使用醒目的颜色组合
+		streamingIcon := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#89DCEB")).
+			Bold(true).
+			Render(frame)
+
+		streamingLabel := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#74C7EC")).
+			Bold(true).
+			Render(" STREAMING ")
+
+		streamingTime := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#89B4FA")).
+			Render(timeIndicator)
+
+		separator := lipgloss.NewStyle().
+			Foreground(cOverlay0).
+			Render(" • ")
+
+		statusContent := streamingIcon + streamingLabel + separator + streamingTime
+
+		// 填充剩余空间到完整宽度
+		usedWidth := lipgloss.Width(statusContent) + 2 // 左右各一个空格
+		remainingWidth := max(0, m.width-usedWidth)
+
+		fillLine := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#313244")).
+			Render(strings.Repeat("━", remainingWidth))
+
+		statusBar := " " + statusContent + " " + fillLine
+
+		return footer + "\n" + statusBar
+	}
+
+	return footer
 }
