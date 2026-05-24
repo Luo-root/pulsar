@@ -64,6 +64,7 @@ type Skill struct {
 
 type Memory struct {
 	Path               string `yaml:"path"`
+	PromptPath         string `yaml:"prompt_path"`
 	MaxHistoryMessages int    `yaml:"max_history_messages"`
 	ReserveTokens      int    `yaml:"reserve_tokens"`
 }
@@ -107,6 +108,7 @@ func SaveConfig(config *Config, filePath string) error {
 	config.Memory.MaxHistoryMessages = 200
 	config.Memory.ReserveTokens = 8000
 	config.Memory.Path = filepath.Join(basePath, "memory.db")
+	config.Memory.PromptPath = filepath.Join(basePath, "system_prompt")
 
 	// Mcp & Skill 配置
 	config.Mcp.Path = filepath.Join(basePath, "pulse-mcp.json")
@@ -134,6 +136,11 @@ func SaveConfig(config *Config, filePath string) error {
 		return fmt.Errorf("failed to create skills directory: %w", err)
 	}
 
+	// 创建 system_prompt 目录并写入默认文件
+	if err := initSystemPrompts(config.Memory.PromptPath); err != nil {
+		return fmt.Errorf("failed to initialize system prompts: %w", err)
+	}
+
 	// 序列化为 YAML
 	data, err := yaml.Marshal(config)
 	if err != nil {
@@ -143,6 +150,33 @@ func SaveConfig(config *Config, filePath string) error {
 	// 写入文件
 	if err := os.WriteFile(filePath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
+	}
+
+	return nil
+}
+
+// initSystemPrompts 初始化系统提示词文件
+func initSystemPrompts(promptDir string) error {
+	// 创建目录
+	if err := os.MkdirAll(promptDir, 0755); err != nil {
+		return fmt.Errorf("failed to create prompt directory: %w", err)
+	}
+
+	// 定义默认文件内容
+	defaultFiles := map[string]string{
+		"rules.md":         rules,
+		"safety.md":        safety,
+		"system_prompt.md": systemPrompt,
+	}
+
+	// 写入每个文件（仅在文件不存在时创建）
+	for filename, content := range defaultFiles {
+		filePath := filepath.Join(promptDir, filename)
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+				return fmt.Errorf("failed to create %s: %w", filename, err)
+			}
+		}
 	}
 
 	return nil
@@ -247,10 +281,52 @@ func validateConfig(config *Config) error {
 
 // GetDefaultConfigPath 获取默认配置文件路径
 func GetDefaultConfigPath() (string, error) {
-	homeDir, err := os.UserHomeDir()
+	configDir, err := os.UserConfigDir()
 	if err != nil {
 		return "", fmt.Errorf("failed to get home directory: %w", err)
 	}
 
-	return filepath.Join(homeDir, ".pulse-tui", "config.yaml"), nil
+	return filepath.Join(configDir, ".pulse-tui", "config.yaml"), nil
 }
+
+const (
+	rules = `# 铁律一：工作目录约束（绝对禁止违反）
+当前固定工作目录：{{work_dir}}
+1. 所有文件/文件夹操作 必须基于此目录执行，禁止使用绝对路径、禁止跳出目录、禁止擅自修改路径
+2. 每次执行工具前，必须再次确认工作目录正确无误
+3. 若涉及路径拼接，必须以当前工作目录为根路径，拼接后需调用工具验证路径合法性
+4. 任何场景下均不得绕过工作目录约束执行文件操作
+
+# 工具调用规则（强制高频调用）
+1. 【不确定 → 必须调用工具】：信息不明确、数据未验证、路径/内容存疑 → 立即调用工具查询确认
+2. 【主动确认】：用户需求模糊、参数缺失、结果需要校验 → 主动调用工具获取真实信息
+3. 【多轮验证】：工具返回结果后，若仍不完整/不准确 → 继续调用工具补充查询，直至信息完整无误
+4. 【禁止凭空回答】：无工具验证的信息，绝对不输出给用户；工具能完成的操作，绝不依赖记忆/常识猜测
+5. 【优先工具】：所有关键操作（路径验证、内容读取、命令执行等）优先通过工具完成，禁止主观判断
+
+## 记忆管理
+你在以下情况必须调用 user_config 工具：
+1. 用户表达了明确偏好 → set_preference
+   例："我喜欢简洁的回答"、"代码用 TypeScript"
+2. 用户设定了行为规则 → set_rules
+   例："回复不要用 emoji"、"代码注释用中文"
+3. 对话开始时 → get_preference + get_rules 获取已存储的配置
+`
+	safety = `# 安全策略（与工具调用/工作目录约束强绑定）
+1. 禁止执行危险命令：rm -rf、mkfs、dd、rd /s、del /s 等；任何命令执行前，必须先调用工具完成安全检查，再询问用户确认
+2. 禁止访问系统敏感目录：/etc/passwd、C:\Windows\System32\config 等；目录访问前需调用工具验证路径，确认非敏感目录后方可操作
+3. 禁止执行破坏性操作：格式化磁盘、删除系统文件、修改系统配置等；涉及文件/目录修改操作时，必须先验证路径是否在工作目录内，再确认操作安全性
+4. 如遇不确定操作（包括但不限于命令安全性、路径合法性、操作影响范围），先调用工具验证信息，再询问用户确认，禁止擅自执行
+5. 工作目录内的文件操作也需遵守安全策略，禁止在工作目录内执行危险命令/破坏性操作
+`
+	systemPrompt = `# 核心身份
+你是专业的自动化执行助手，严格遵守所有指令与约束规则，绝不臆测、绝不编造任何信息，输出内容完全基于工具返回的真实数据。
+
+# 行为准则
+1. 不确定 → 必须调用工具：信息不明确、数据未验证、路径/内容存疑时，立即调用工具查询确认
+2. 主动确认：用户需求模糊、参数缺失、结果需要校验时，主动调用工具获取真实信息
+3. 禁止凭空回答：无工具验证的信息，绝对不输出给用户；绝不依赖记忆/常识猜测
+4. 所有操作基于工具返回的真实数据：路径、文件名、内容等关键信息必须经过工具验证
+5. 严格执行工具调用循环：直到信息完整、确认无误后，方可终止工具调用并输出结果
+`
+)

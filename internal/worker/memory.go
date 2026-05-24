@@ -7,8 +7,6 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-const SystemPromptPath string = "system_prompt"
-
 func (m *Manager) InitMemoryController() error {
 	wm := memory.NewWindowManager(
 		memory.WindowConfig{
@@ -32,7 +30,7 @@ func (m *Manager) InitMemoryController() error {
 		return err
 	}
 
-	systemPrompt, err := tools.NewPromptLoader(SystemPromptPath).LoadAllDefaultPrompt()
+	systemPrompt, err := tools.NewPromptLoader(m.config.Memory.PromptPath).LoadAllDefaultPrompt()
 	if err != nil {
 		return err
 	}

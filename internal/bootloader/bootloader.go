@@ -138,7 +138,7 @@ func (m model) Init() tea.Cmd {
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
-	// ⭐ 关键：始终将消息传递给 textinput（支持粘贴）
+	// 关键：始终将消息传递给 textinput（支持粘贴）
 	if m.currentStep == stepConfig {
 		if m.input.focusedInput == 0 {
 			m.input.baseUrlInput, cmd = m.input.baseUrlInput.Update(msg)
@@ -167,7 +167,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.modelCursor--
 				}
 			} else if m.currentStep == stepConfig {
-				// ⭐ 在配置页面切换输入框焦点
+				// 在配置页面切换输入框焦点
 				if m.input.focusedInput == 1 {
 					m.input.focusedInput = 0
 					m.input.baseUrlInput.Focus()
@@ -189,7 +189,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.modelCursor++
 				}
 			} else if m.currentStep == stepConfig {
-				// ⭐ 在配置页面切换输入框焦点
+				// 在配置页面切换输入框焦点
 				if m.input.focusedInput == 0 {
 					m.input.focusedInput = 1
 					m.input.apiKeyInput.Focus()
@@ -216,14 +216,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.currentStep = stepSelectModel
 				m.modelCursor = 0
 
-				// ⭐ 使用异步命令获取模型列表
+				// 使用异步命令获取模型列表
 				vendor := m.vendorChoices[m.selectedVendor]
 				apiKey := m.input.apiKeyInput.Value()
 				return m, fetchModelsCmd(vendor, apiKey)
 			} else if m.currentStep == stepSelectModel {
 				if len(m.modelChoices) > 0 {
 					m.selectedModel = m.modelCursor
-					// ⭐ 保存配置
+					// 保存配置
 					config := &Config{
 						Version:   "1.0.0",
 						CreatedAt: time.Now(),
@@ -285,7 +285,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-	// ⭐ 处理异步消息
+	// 处理异步消息
 	case modelsLoadedMsg:
 		m.modelChoices = msg.models
 		m.isLoading = false
@@ -299,7 +299,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// ⭐ 添加异步命令类型
+// 添加异步命令类型
 type modelsLoadedMsg struct {
 	models []string
 }
@@ -308,7 +308,7 @@ type modelsLoadErrMsg struct {
 	err error
 }
 
-// ⭐ 添加异步获取模型的命令
+// 添加异步获取模型的命令
 func fetchModelsCmd(vendor, apiKey string) tea.Cmd {
 	return func() tea.Msg {
 		models, err := getModelList(vendor, apiKey)
@@ -473,7 +473,7 @@ func (m model) View() tea.View {
 			lines = append(lines, fmt.Sprintf("API Key: %s", apiKeyValue))
 		}
 		lines = append(lines, "")
-		// ⭐ 显示保存状态
+		// 显示保存状态
 		if m.configSaved {
 			saveInfo := fmt.Sprintf("💾 配置已保存至: %s", m.configPath)
 			lines = append(lines, m.successStyle.Render(saveInfo))
@@ -491,7 +491,7 @@ func (m model) View() tea.View {
 	v.WindowTitle = "Pulse - TUI"
 	v.AltScreen = true
 
-	// ⭐ 只在配置页面显示光标
+	// 只在配置页面显示光标
 	if m.currentStep == stepConfig {
 		if m.input.focusedInput == 0 {
 			v.Cursor = m.input.baseUrlInput.Cursor()
