@@ -1,0 +1,12 @@
+# 本地草稿与一次性脚本，不进仓库
+_scratch/
+
+# 构建产物
+/bin/
+/dist/
+*.exe
+
+# 本地运行时数据（会话、记忆库、日志、凭据一律不进 git）
+/data/
+*.local.yaml
+.local.env
