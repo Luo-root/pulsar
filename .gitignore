@@ -1,6 +1,13 @@
 # 本地草稿与一次性脚本，不进仓库
 _scratch/
 
+# 本地开发的工作区文件（指向本地 pulse 克隆）；提交主仓的 go.mod 用发布版本
+go.work
+go.work.sum
+
+# 真配置（含本机路径），仓库只留 pulsar.example.yaml
+pulsar.yaml
+
 # 构建产物
 /bin/
 /dist/

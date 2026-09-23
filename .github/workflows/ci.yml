@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build / vet / test (race)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # 只报失败、不自动修：自动修要 CI 有写权限并产生「CI 提交」，与「改动必须人审」冲突。
+      #
+      # 取文件集用 `git ls-files '*.go'` 而非 `gofmt -l .`：后者会连未跟踪目录一起扫
+      # （本仓有 _scratch/ 与 data/，正是这类噪声源）。
+      #
+      # gofmt 走显式路径 `$(go env GOROOT)/bin/gofmt`：PATH 上可能是旧版，解析不了泛型
+      # 一类的新语法（表现为全量报错）；显式路径让「与 go.mod 指定的工具链一致」自证。
+      #
+      # `2>&1` 必须配 `|| true`：Actions 的 run 是 `bash -e`，gofmt 解析失败时退出 2，
+      # 少了 `|| true` 会让**赋值语句本身**失败、脚本在赋值行中止——门禁真红了，但捕获到
+      # 的错误文本随中止一起丢弃，日志一片空白。
+      #
+      # 这三条与上游 pulse-web 的门禁同口径（那边是踩过一遍才定下来的）。
+      - name: gofmt
+        run: |
+          files="$(git ls-files '*.go')"
+          if [ -z "$files" ]; then
+            echo "没有跟踪的 .go 文件，跳过"
+            exit 0
+          fi
+          out="$("$(go env GOROOT)/bin/gofmt" -l $files 2>&1)" || true
+          if [ -n "$out" ]; then
+            echo "gofmt 报出问题（未格式化的文件，或解析错误）："
+            echo "$out"
+            exit 1
+          fi
+
+      # 测试不需要任何凭据：模型走 scripted provider，网络与真实 API 不在测试路径上。
+      - name: Test (race)
+        run: go test -race ./...

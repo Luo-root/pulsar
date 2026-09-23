@@ -1,0 +1,211 @@
+package config_test
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/Luo-root/pulsar/internal/config"
+)
+
+const minimal = `
+models:
+  - name: main
+    provider: openai
+    model: gpt-5
+`
+
+// writeConfig 把配置正文落进 dir/pulsar.yaml，返回文件路径。
+func writeConfig(t *testing.T, dir, body string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "pulsar.yaml")
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// realDir 返回目录解析符号链接后的路径——Load 以真实目录为相对基准，比对期望
+// 值时也要先解析，免得把平台细节（TempDir 可能带 junction 成分）当成被测行为。
+func realDir(t *testing.T, dir string) string {
+	t.Helper()
+	r, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%s): %v", dir, err)
+	}
+	return r
+}
+
+func TestLoad_DefaultsAndRelativePaths(t *testing.T) {
+	base := t.TempDir()
+	cfg, err := config.Load(writeConfig(t, base, minimal))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Agent.Name != config.DefaultAgentName {
+		t.Fatalf("agent.name = %q, want %q", cfg.Agent.Name, config.DefaultAgentName)
+	}
+	if want := filepath.Join(realDir(t, base), config.DefaultSessionsDir); cfg.SessionsDir != want {
+		t.Fatalf("sessions_dir = %q, want %q", cfg.SessionsDir, want)
+	}
+	if want := filepath.Join(realDir(t, base), config.DefaultLogsDir); cfg.LogsDir != want {
+		t.Fatalf("logs_dir = %q, want %q", cfg.LogsDir, want)
+	}
+	if len(cfg.Models) != 1 || cfg.Models[0].Name != "main" {
+		t.Fatalf("models = %+v", cfg.Models)
+	}
+}
+
+// TestLoad_WorkspacePoliciesStayVerbatim 盯住「策略不在这里烙成绝对路径」：
+// write_roots / forbid_read 必须原样保留——它们的相对基准是**回合时生效的工作区**，
+// 不是配置文件所在目录。
+func TestLoad_WorkspacePoliciesStayVerbatim(t *testing.T) {
+	base := t.TempDir()
+	absDir := t.TempDir()
+	body := fmt.Sprintf(`
+models:
+  - name: main
+    provider: openai
+    model: gpt-5
+workspace:
+  write_roots: ["./out", %q]
+  forbid_read: ["./.git"]
+sessions_dir: ./state/sessions
+logs_dir: ./state/logs
+`, absDir)
+	cfg, err := config.Load(writeConfig(t, base, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Workspace.WriteRoots; len(got) != 2 || got[0] != "./out" || got[1] != absDir {
+		t.Fatalf("write_roots = %v，应当原样保留（回合时相对工作区解析）", got)
+	}
+	if got := cfg.Workspace.ForbidRead; len(got) != 1 || got[0] != "./.git" {
+		t.Fatalf("forbid_read = %v，应当原样保留", got)
+	}
+	// 而配置自己的目录类字段仍相对配置文件目录解析。
+	real := realDir(t, base)
+	if want := filepath.Join(real, "state", "sessions"); cfg.SessionsDir != want {
+		t.Fatalf("sessions_dir = %q, want %q", cfg.SessionsDir, want)
+	}
+	if want := filepath.Join(real, "state", "logs"); cfg.LogsDir != want {
+		t.Fatalf("logs_dir = %q, want %q", cfg.LogsDir, want)
+	}
+}
+
+func TestLoad_Errors(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"没有模型", `agent: {name: x}`, "models is empty"},
+		{"模型重名", `
+models:
+  - {name: a, provider: p, model: m}
+  - {name: a, provider: p, model: m}
+`, "duplicate name"},
+		{"模型缺名字", `
+models:
+  - {provider: p, model: m}
+`, "name is required"},
+		{"模型缺 provider", `
+models:
+  - {name: a, model: m}
+`, "provider is required"},
+		{"模型缺 model", `
+models:
+  - {name: a, provider: p}
+`, "model is required"},
+		{"YAML 语法坏", "models: [}", "parse"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := config.Load(writeConfig(t, t.TempDir(), c.body))
+			if err == nil {
+				t.Fatalf("want error containing %q, got nil", c.want)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err = %v, want containing %q", err, c.want)
+			}
+		})
+	}
+}
+
+func TestLoad_MissingFile(t *testing.T) {
+	if _, err := config.Load(filepath.Join(t.TempDir(), "nope.yaml")); err == nil {
+		t.Fatal("文件不存在时应当报错")
+	}
+}
+
+func TestModel_APIKey(t *testing.T) {
+	const envName = "PULSAR_TEST_API_KEY"
+
+	withEnv := config.Model{Name: "main", Provider: "openai", Model: "gpt-5", APIKeyEnv: envName}
+	t.Setenv(envName, "")
+	if _, err := withEnv.APIKey(); err == nil {
+		t.Fatal("api_key_env 设了但环境变量为空时应当报错（不静默降级成无凭据请求）")
+	}
+	t.Setenv(envName, "sk-test-value")
+	got, err := withEnv.APIKey()
+	if err != nil {
+		t.Fatalf("APIKey: %v", err)
+	}
+	if got != "sk-test-value" {
+		t.Fatalf("APIKey = %q", got)
+	}
+
+	// 没配 api_key_env：返回空串，交给 adapter 的默认来源。
+	plain := config.Model{Name: "x", Provider: "openai", Model: "m"}
+	if v, err := plain.APIKey(); err != nil || v != "" {
+		t.Fatalf("未配 api_key_env 时 = (%q, %v)，want (\"\", nil)", v, err)
+	}
+}
+
+func TestConfig_ModelLookup(t *testing.T) {
+	base := t.TempDir()
+	cfg, err := config.Load(writeConfig(t, base, `
+models:
+  - {name: first, provider: openai, model: m1}
+  - {name: second, provider: anthropic, model: m2}
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if m, err := cfg.Model(""); err != nil || m.Name != "first" {
+		t.Fatalf("Model(\"\") = (%+v, %v)，want first", m, err)
+	}
+	if m, err := cfg.Model("second"); err != nil || m.Provider != "anthropic" {
+		t.Fatalf("Model(\"second\") = (%+v, %v)", m, err)
+	}
+	if _, err := cfg.Model("missing"); err == nil {
+		t.Fatal("未知模型名应当报错")
+	}
+}
+
+// TestLoad_SymlinkedConfigResolvesToTargetDir 盯住「相对基准 = 配置真实所在目录」：
+// 把配置软链到别处，配置自身的相对目录仍应落在**目标**目录下。
+func TestLoad_SymlinkedConfigResolvesToTargetDir(t *testing.T) {
+	real := t.TempDir()
+	realCfg := writeConfig(t, real, minimal)
+	linkDir := t.TempDir()
+	link := filepath.Join(linkDir, "pulsar.yaml")
+	if err := os.Symlink(realCfg, link); err != nil {
+		t.Skipf("本机不支持创建符号链接：%v", err)
+	}
+	cfg, err := config.Load(link)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if want := filepath.Join(realDir(t, real), config.DefaultSessionsDir); cfg.SessionsDir != want {
+		t.Fatalf("sessions_dir = %q, want 链接目标下的 %q", cfg.SessionsDir, want)
+	}
+	if strings.HasPrefix(cfg.SessionsDir, realDir(t, linkDir)) {
+		t.Fatal("相对基准落到了链接所在目录——EvalSymlinks 没生效")
+	}
+}

@@ -1,0 +1,197 @@
+// Package config 收敛 pulsar 的配置面：模型声明、工具策略、落盘目录。
+//
+// 两条纪律：
+//
+//  1. 凭据只以**环境变量名**形式出现（api_key_env）；密钥本体永不进配置文件、
+//     不进日志、不进仓库。
+//  2. **工作区不在本文件里。** 工作区是会话/项目级属性——pulse 的
+//     `SessionHeader.Workspace` 就是为它留的字段，由调用方在建会话时给出、随会话
+//     持久化（见 internal/app 的 Turn.Workspace）。本文件只承载**策略**（写根、
+//     读禁、工具子集），其相对路径在**回合时相对生效的工作区**解析——不是在这里
+//     烙成绝对路径。
+package config
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"gopkg.in/yaml.v3"
+)
+
+// DefaultPath 是未显式指定时的配置文件路径（相对当前工作目录）。
+const DefaultPath = "pulsar.yaml"
+
+// DefaultAgentName 是未配置 agent.name 时的 agent 标识。
+const DefaultAgentName = "pulsar"
+
+// 默认落盘目录（相对配置文件所在目录解析）。
+const (
+	DefaultSessionsDir = "data/sessions"
+	DefaultLogsDir     = "data/logs"
+)
+
+// Model 是一条模型声明：pulsar 侧的名字 + provider + provider 侧模型 id。
+type Model struct {
+	// Name 是 pulsar 侧的模型名（会话审计、观测、路由都用它）。
+	Name string `yaml:"name"`
+	// Provider 是 provider 名：openai / openai-responses / anthropic。
+	Provider string `yaml:"provider"`
+	// Model 是 provider 侧的模型 id（如 gpt-5、claude-sonnet-4-5）。
+	Model string `yaml:"model"`
+	// BaseURL 覆盖 provider 默认端点（网关 / 兼容服务）；空 = 用默认。
+	BaseURL string `yaml:"base_url,omitempty"`
+	// APIKeyEnv 是**存放密钥的环境变量名**；空则交给 adapter 的默认来源。
+	APIKeyEnv string `yaml:"api_key_env,omitempty"`
+	// Options 是 provider 特有参数（超时、组织、自定义头…），原样交给 adapter。
+	//
+	// 类型契约：adapter 走 JSON 往返把 Options 解到自己的类型化字段，所以 YAML
+	// 标量的 int / float64 差异不影响取值；真给了不兼容的类型（例如数字位置写
+	// 字符串）会在**声明期**显式报 `ErrBadRequest`「options 类型不匹配」，不会
+	// 静默取零值。
+	Options map[string]any `yaml:"options,omitempty"`
+}
+
+// Workspace 是工具面的**策略**——注意这里没有「根」：根是会话属性，由调用方在
+// 建会话时给出（Turn.Workspace），本段只描述「在这个工作区里允许做什么」。
+type Workspace struct {
+	// WriteRoots 限制写操作（edit / write / apply_patch）的目标；空 = 只允许
+	// 工作区自身。相对路径相对**生效的工作区**解析。
+	WriteRoots []string `yaml:"write_roots,omitempty"`
+	// ForbidRead 是读操作（read / ls / glob / grep）不得进入的路径前缀。
+	// 相对路径相对**生效的工作区**解析。
+	ForbidRead []string `yaml:"forbid_read,omitempty"`
+}
+
+// Tools 控制内置工具的装配子集。
+type Tools struct {
+	// Enabled 非空时只装配列出的内置工具；空 = 全部。
+	Enabled []string `yaml:"enabled,omitempty"`
+}
+
+// Agent 是 agent 标识与系统提示词。
+type Agent struct {
+	// Name 是 agent 标识；空则用 DefaultAgentName。
+	Name string `yaml:"name,omitempty"`
+	// System 是系统提示词；空 = 无。
+	System string `yaml:"system,omitempty"`
+}
+
+// Config 是 pulsar 的单一配置。
+type Config struct {
+	// Models 是模型声明表；至少一条。
+	Models []Model `yaml:"models"`
+	// Agent 是 agent 标识与系统提示词。
+	Agent Agent `yaml:"agent,omitempty"`
+	// Workspace 是工具面的策略（不含根，见 Workspace 的说明）。
+	Workspace Workspace `yaml:"workspace,omitempty"`
+	// Tools 控制内置工具子集。
+	Tools Tools `yaml:"tools,omitempty"`
+	// SessionsDir 是会话日志目录（JSONL 明文，文件即密钥面）。
+	SessionsDir string `yaml:"sessions_dir,omitempty"`
+	// LogsDir 是观测日志目录。
+	LogsDir string `yaml:"logs_dir,omitempty"`
+}
+
+// Load 读配置、填默认值、校验。path 为空时用 DefaultPath；本文件里的相对路径
+// （sessions_dir / logs_dir）相对**配置文件真实所在目录**解析（符号链接会先解析到
+// 目标目录，因此链接放在哪里不影响结果；与调用方 CWD 无关）。
+//
+// 工作区不在本文件里——见包注释。
+func Load(path string) (*Config, error) {
+	if path == "" {
+		path = DefaultPath
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("config: resolve %s: %w", path, err)
+	}
+	// 解析符号链接：相对基准应是配置文件**真实**所在目录，而不是链接所在目录。
+	// 解析失败（例如路径不存在）不在此处报错——留给 ReadFile 给出更准确的错。
+	if resolved, rerr := filepath.EvalSymlinks(abs); rerr == nil {
+		abs = resolved
+	}
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		return nil, fmt.Errorf("config: read %s: %w", abs, err)
+	}
+	var c Config
+	if err := yaml.Unmarshal(data, &c); err != nil {
+		return nil, fmt.Errorf("config: parse %s: %w", abs, err)
+	}
+	if err := c.finalize(filepath.Dir(abs)); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+// finalize 填默认值并把本文件里的相对目录落到 base 上。失败即配置错误——宁可
+// 启动期明确报错，也不要跑到回合中段才失败。
+func (c *Config) finalize(base string) error {
+	if c.Agent.Name == "" {
+		c.Agent.Name = DefaultAgentName
+	}
+	if len(c.Models) == 0 {
+		return errors.New("config: models is empty (declare at least one model)")
+	}
+	seen := make(map[string]bool, len(c.Models))
+	for i := range c.Models {
+		m := &c.Models[i]
+		if m.Name == "" {
+			return fmt.Errorf("config: models[%d]: name is required", i)
+		}
+		if seen[m.Name] {
+			return fmt.Errorf("config: models: duplicate name %q", m.Name)
+		}
+		seen[m.Name] = true
+		if m.Provider == "" {
+			return fmt.Errorf("config: model %q: provider is required", m.Name)
+		}
+		if m.Model == "" {
+			return fmt.Errorf("config: model %q: model is required", m.Name)
+		}
+	}
+	if c.SessionsDir == "" {
+		c.SessionsDir = DefaultSessionsDir
+	}
+	if c.LogsDir == "" {
+		c.LogsDir = DefaultLogsDir
+	}
+	c.SessionsDir = resolve(base, c.SessionsDir)
+	c.LogsDir = resolve(base, c.LogsDir)
+	return nil
+}
+
+// Model 按名取模型声明；name 为空时取第一条。
+func (c *Config) Model(name string) (Model, error) {
+	if name == "" {
+		return c.Models[0], nil
+	}
+	for _, m := range c.Models {
+		if m.Name == name {
+			return m, nil
+		}
+	}
+	return Model{}, fmt.Errorf("config: unknown model %q", name)
+}
+
+// APIKey 解析该模型的凭据。api_key_env 为空 → 返回空串（交给 adapter 的默认
+// 来源）；设了却取不到 → 报错，不静默降级成无凭据请求。
+func (m Model) APIKey() (string, error) {
+	if m.APIKeyEnv == "" {
+		return "", nil
+	}
+	v := os.Getenv(m.APIKeyEnv)
+	if v == "" {
+		return "", fmt.Errorf("config: model %q: env %s is unset or empty", m.Name, m.APIKeyEnv)
+	}
+	return v, nil
+}
+
+func resolve(base, p string) string {
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p)
+	}
+	return filepath.Clean(filepath.Join(base, p))
+}

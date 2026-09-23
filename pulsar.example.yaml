@@ -1,0 +1,52 @@
+# pulsar 配置样例：复制为 pulsar.yaml 后按需修改。
+#
+# 凭据纪律：这里只放**环境变量名**（api_key_env）；密钥本体不进配置文件、
+# 不进日志、不进仓库。
+#
+# 相对路径一律相对**本配置文件所在目录**解析（与调用方 CWD 无关）。
+
+agent:
+  name: pulsar
+  system: |
+    你是 pulsar，一个本地优先的 AI 总管。
+    回答先给结论，再给必要的细节；不确定就说不确定。
+
+# 工作区**不在这里配**：它是会话/项目级属性——由调用方给出（CLI 用 -C，缺省 =
+# 当前目录；本地 API 在建会话时带上），写进会话头随会话持久化，续跑以会话记录的
+# 为准。这一段只放「在这个工作区里允许做什么」的策略，下面的相对路径在**回合时
+# 相对生效的工作区**解析（不是相对本文件）。
+workspace:
+  # 写操作（edit / write / apply_patch）的目标根；空 = 只允许工作区自身。
+  # write_roots:
+  #   - .
+  # 读操作（read / ls / glob / grep）不得进入的路径前缀。
+  # forbid_read:
+  #   - ./.git
+
+tools:
+  # 非空时只装配列出的内置工具；空 = 全部。
+  # 可选：read ls glob grep exec job_output job_kill edit write apply_patch
+  #       web_fetch web_search question
+  enabled: []
+
+sessions_dir: data/sessions
+logs_dir: data/logs
+
+models:
+  - name: main
+    provider: openai          # openai | openai-responses | anthropic
+    model: gpt-5
+    api_key_env: OPENAI_API_KEY
+    # base_url: https://api.openai.com/v1   # 网关 / 兼容服务时覆盖
+    # options:
+    #   timeout_seconds: 120
+    #   max_retries: 0
+
+  # 再声明一条别的供应商的模型即可多模型并用（run -model claude 切换）：
+  # - name: claude
+  #   provider: anthropic
+  #   model: claude-sonnet-4-5
+  #   api_key_env: ANTHROPIC_API_KEY
+  #
+  # options 的类型：走 adapter 的 JSON 往返解析，数字写数字、字符串写字符串；
+  # 类型不符会在启动期显式报错（不会静默取零值）。
