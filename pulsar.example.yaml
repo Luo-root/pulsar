@@ -1,0 +1,40 @@
+# pulsar 配置样例：复制为 pulsar.yaml 后按需修改。
+#
+# 凭据纪律：这里只放**环境变量名**（api_key_env）；密钥本体不进配置文件、
+# 不进日志、不进仓库。
+#
+# 相对路径一律相对**本配置文件所在目录**解析（与调用方 CWD 无关）。
+
+agent:
+  name: pulsar
+  system: |
+    你是 pulsar，一个本地优先的 AI 总管。
+    回答先给结论，再给必要的细节；不确定就说不确定。
+
+workspace:
+  # 默认工作区根：工具的相对路径基准，读写的边界基准。必填。
+  root: .
+  # 写操作（edit / write / apply_patch）的目标根；空 = 只允许 root。
+  # write_roots:
+  #   - .
+  # 读操作不得进入的路径前缀。
+  # forbid_read:
+  #   - ./.git
+
+tools:
+  # 非空时只装配列出的内置工具；空 = 全部。
+  # 可选：read ls glob grep exec job_output job_kill edit write apply_patch
+  #       web_fetch web_search question
+  enabled: []
+
+sessions_dir: data/sessions
+logs_dir: data/logs
+
+models:
+  - name: main
+    provider: openai          # openai | openai-responses | anthropic
+    model: gpt-5
+    api_key_env: OPENAI_API_KEY
+    # base_url: https://api.openai.com/v1   # 网关 / 兼容服务时覆盖
+    # options:
+    #   timeout_seconds: 120
