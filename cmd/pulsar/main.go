@@ -11,7 +11,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/Luo-root/pulse/host"
 	"github.com/Luo-root/pulse/llm"
@@ -32,6 +34,7 @@ const usage = `pulsar —— 本地优先的 AI 总管
   配置文件默认 ./pulsar.yaml，相对路径相对配置文件所在目录解析；
   凭据只以环境变量名出现在配置里（api_key_env），密钥不进文件、不进日志。
   工具调用默认逐次在终端询问；-y 跳过审批门（所有调用直接执行）。
+  Ctrl+C 取消当前回合（日志闭合为 interrupted，下次可续跑），不会留下半开的会话。
 `
 
 func main() {
@@ -83,7 +86,12 @@ func runTurn(args []string) error {
 	}
 	defer a.Close()
 
-	res, err := a.RunTurn(context.Background(), app.Turn{
+	// Ctrl+C / SIGTERM 走 ctx 取消，而不是让进程被杀：回合日志在 turn_end 处
+	// 闭合为 interrupted，落盘停在真实现场，下次 Open 冷恢复接着跑。
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	res, err := a.RunTurn(ctx, app.Turn{
 		SessionID: *sessionID,
 		Model:     *modelName,
 		Prompt:    prompt,
@@ -95,11 +103,19 @@ func runTurn(args []string) error {
 		fmt.Fprintf(os.Stderr, "\n---\nsession %s\nsteps %d  stopped_by %s  tokens in=%d out=%d\n",
 			res.SessionID, res.Steps, res.StoppedBy, res.Usage.InputTokens, res.Usage.OutputTokens)
 	}
+	if err != nil && res != nil {
+		// 部分产出是有效产出（canceled / 中途基础设施失败）：先消费再报错。
+		fmt.Fprintf(os.Stderr, "pulsar: 回合未正常结束（stopped_by %s）：%v\n", res.StoppedBy, err)
+	}
 	return err
 }
 
 // gateFor 返回工具审批门：-y 时返回 nil（不设防，显式选择）；否则逐次在终端
 // 询问，读不到输入即视为拒绝（fail closed）。
+//
+// 门持有同一个 stdin reader（闭包捕获）。当前 CLI 的 prompt 走命令行参数、不
+// 读 stdin，所以不存在「reader 预读吃掉 prompt」的问题；将来若加交互式 REPL，
+// 需要把 stdin 收口到一处统一管理。
 func gateFor(assumeYes bool) host.ToolGate {
 	if assumeYes {
 		return nil

@@ -39,6 +39,11 @@ type Model struct {
 	// APIKeyEnv 是**存放密钥的环境变量名**；空则交给 adapter 的默认来源。
 	APIKeyEnv string `yaml:"api_key_env,omitempty"`
 	// Options 是 provider 特有参数（超时、组织、自定义头…），原样交给 adapter。
+	//
+	// 类型契约：adapter 走 JSON 往返把 Options 解到自己的类型化字段，所以 YAML
+	// 标量的 int / float64 差异不影响取值；真给了不兼容的类型（例如数字位置写
+	// 字符串）会在**声明期**显式报 `ErrBadRequest`「options 类型不匹配」，不会
+	// 静默取零值。
 	Options map[string]any `yaml:"options,omitempty"`
 }
 
@@ -83,7 +88,8 @@ type Config struct {
 }
 
 // Load 读配置、填默认值、校验。path 为空时用 DefaultPath；相对路径一律相对
-// **配置文件所在目录**解析（可预期，不受调用方 CWD 影响）。
+// **配置文件真实所在目录**解析（符号链接会先解析到目标目录，因此链接放在哪里
+// 不影响解析结果；这与调用方 CWD 无关）。
 func Load(path string) (*Config, error) {
 	if path == "" {
 		path = DefaultPath
@@ -91,6 +97,11 @@ func Load(path string) (*Config, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("config: resolve %s: %w", path, err)
+	}
+	// 解析符号链接：相对基准应是配置文件**真实**所在目录，而不是链接所在目录。
+	// 解析失败（例如路径不存在）不在此处报错——留给 ReadFile 给出更准确的错。
+	if resolved, rerr := filepath.EvalSymlinks(abs); rerr == nil {
+		abs = resolved
 	}
 	data, err := os.ReadFile(abs)
 	if err != nil {

@@ -38,3 +38,13 @@ models:
     # base_url: https://api.openai.com/v1   # 网关 / 兼容服务时覆盖
     # options:
     #   timeout_seconds: 120
+    #   max_retries: 0
+
+  # 再声明一条别的供应商的模型即可多模型并用（run -model claude 切换）：
+  # - name: claude
+  #   provider: anthropic
+  #   model: claude-sonnet-4-5
+  #   api_key_env: ANTHROPIC_API_KEY
+  #
+  # options 的类型：走 adapter 的 JSON 往返解析，数字写数字、字符串写字符串；
+  # 类型不符会在启动期显式报错（不会静默取零值）。

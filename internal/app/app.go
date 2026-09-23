@@ -34,6 +34,9 @@ const HostID = "pulsar"
 // ObservabilityFile 是观测落盘的默认文件名（在 cfg.LogsDir 下）。
 const ObservabilityFile = "observability.log"
 
+// ErrClosed 表示 runtime 已关闭（Close 之后不再接受回合）。
+var ErrClosed = errors.New("app: runtime is closed")
+
 // Options 是装配参数。
 type Options struct {
 	// Config 是单一配置面。必填。
@@ -61,6 +64,9 @@ type App struct {
 	// 持有文件锁与日志句柄，官方契约要求「正常路径用完即 Close」（会话的 Close
 	// 在 Session 接口之外，是文件实现特有的释放，按契约做类型断言调用）。
 	opened map[string]session.Session
+	// closed 标记 runtime 已回收；此后 RunTurn 显式报错，而不是在 nil 内核上
+	// 炸掉（Read 语义：Close 之后本实例只读，不再发回合）。
+	closed bool
 }
 
 // New 装配 runtime。失败时不留下半开的资源（已建的文件与内核一并回收）。
@@ -136,12 +142,17 @@ func New(opt Options) (*App, error) {
 }
 
 // Close 回收 runtime：先释放会话写者（文件锁与日志句柄），再 kernel.Dispose
-// 逆序还原全部已装载插件的效应，最后关闭观测日志。幂等。
+// 逆序还原全部已装载插件的效应，最后关闭观测日志。幂等——第二次调用返回 nil。
 func (a *App) Close() error {
 	if a == nil {
 		return nil
 	}
 	a.sessMu.Lock()
+	if a.closed {
+		a.sessMu.Unlock()
+		return nil
+	}
+	a.closed = true
 	opened := a.opened
 	a.opened = nil
 	a.sessMu.Unlock()
@@ -172,7 +183,8 @@ func (a *App) Close() error {
 // Config 返回生效配置（只读用途）。
 func (a *App) Config() *config.Config { return a.cfg }
 
-// Host 暴露宿主装配（进阶用法：自定义 agent 构造、工具注册面）。
+// Host 暴露宿主装配（进阶用法：自定义 agent 构造、工具注册面）。Close 之后
+// 返回的是内核已回收的宿主，只可读、不可再发回合。
 func (a *App) Host() *host.Host { return a.host }
 
 // Sessions 暴露会话栈（列表、打开、Fork、导出导入面）。
@@ -217,9 +229,13 @@ type TurnResult struct {
 // SessionID 新建或打开）→ 跑一轮 ReAct → 回传结论与用量。
 //
 // 返回的 error 仅在基础设施失败（模型调用失败、ctx 取消、落盘失败）时非 nil；
-// 此时 TurnResult 仍可能携带已发生的部分（StoppedBy=canceled/error），调用方
-// 应当先消费结果再处理错误。
+// 此时 TurnResult 仍可能携带已发生的部分（StoppedBy=canceled/error）。**调用方
+// 应当先消费结果、再处理错误**——部分产出是有效产出（取消发生在模型已经给出
+// 结论之后时，那个结论不该被丢掉）。
 func (a *App) RunTurn(ctx context.Context, t Turn) (*TurnResult, error) {
+	if a.isClosed() {
+		return nil, ErrClosed
+	}
 	if t.Prompt == "" {
 		return nil, errors.New("app: prompt is required")
 	}
@@ -259,6 +275,12 @@ func (a *App) RunTurn(ctx context.Context, t Turn) (*TurnResult, error) {
 		out.Text = res.Final.Text()
 	}
 	return out, err
+}
+
+func (a *App) isClosed() bool {
+	a.sessMu.Lock()
+	defer a.sessMu.Unlock()
+	return a.closed
 }
 
 // modelDecls 把配置里的模型声明翻译成 host 的声明，顺带把凭据从环境变量取出来
