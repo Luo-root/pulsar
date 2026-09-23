@@ -3,12 +3,9 @@ package app_test
 import (
 	"context"
 	"errors"
-	"io"
 	"testing"
 
-	"github.com/Luo-root/pulse/host"
 	"github.com/Luo-root/pulse/llm"
-	"github.com/Luo-root/pulse/observability"
 
 	"github.com/Luo-root/pulsar/internal/app"
 )
@@ -17,18 +14,14 @@ import (
 // ErrClosed，而不是在已回收的内核上炸掉；Close 本身幂等。
 func TestRunTurn_AfterClose(t *testing.T) {
 	cfg := testConfig(t)
-	a, err := app.New(app.Options{
-		Config:    cfg,
-		Sink:      observability.NewLineSink(io.Discard),
-		Providers: []host.Provider{scripted(map[string]llm.ChatModel{"script-1": llm.NewScripted(llm.Resp("x"))})},
-	})
-	if err != nil {
-		t.Fatalf("app.New: %v", err)
-	}
+	a := newApp(t, cfg, map[string]llm.ChatModel{"script-1": llm.NewScripted(llm.Resp("x"))})
 	if err := a.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if _, err := a.RunTurn(context.Background(), app.Turn{Prompt: "hi"}); !errors.Is(err, app.ErrClosed) {
+	if _, err := a.RunTurn(context.Background(), app.Turn{
+		Workspace: t.TempDir(),
+		Prompt:    "hi",
+	}); !errors.Is(err, app.ErrClosed) {
 		t.Fatalf("RunTurn after Close: err = %v, want ErrClosed", err)
 	}
 	if err := a.Close(); err != nil {

@@ -1,8 +1,14 @@
-// Package config 收敛 pulsar 的单一配置面：模型声明、工作区边界、工具子集与
-// 落盘目录。
+// Package config 收敛 pulsar 的配置面：模型声明、工具策略、落盘目录。
 //
-// 凭据纪律：配置里只出现**环境变量名**（api_key_env）；密钥本体永不进配置
-// 文件、不进日志、不进仓库。
+// 两条纪律：
+//
+//  1. 凭据只以**环境变量名**形式出现（api_key_env）；密钥本体永不进配置文件、
+//     不进日志、不进仓库。
+//  2. **工作区不在本文件里。** 工作区是会话/项目级属性——pulse 的
+//     `SessionHeader.Workspace` 就是为它留的字段，由调用方在建会话时给出、随会话
+//     持久化（见 internal/app 的 Turn.Workspace）。本文件只承载**策略**（写根、
+//     读禁、工具子集），其相对路径在**回合时相对生效的工作区**解析——不是在这里
+//     烙成绝对路径。
 package config
 
 import (
@@ -47,13 +53,14 @@ type Model struct {
 	Options map[string]any `yaml:"options,omitempty"`
 }
 
-// Workspace 是工具面的路径边界（落到 builtins 的 Root / WriteRoots / ForbidRead）。
+// Workspace 是工具面的**策略**——注意这里没有「根」：根是会话属性，由调用方在
+// 建会话时给出（Turn.Workspace），本段只描述「在这个工作区里允许做什么」。
 type Workspace struct {
-	// Root 是默认工作区根（相对路径的解析基准）。必填。
-	Root string `yaml:"root"`
-	// WriteRoots 限制写操作（edit / write / apply_patch）的目标；空 = 只允许 Root。
+	// WriteRoots 限制写操作（edit / write / apply_patch）的目标；空 = 只允许
+	// 工作区自身。相对路径相对**生效的工作区**解析。
 	WriteRoots []string `yaml:"write_roots,omitempty"`
 	// ForbidRead 是读操作（read / ls / glob / grep）不得进入的路径前缀。
+	// 相对路径相对**生效的工作区**解析。
 	ForbidRead []string `yaml:"forbid_read,omitempty"`
 }
 
@@ -77,8 +84,8 @@ type Config struct {
 	Models []Model `yaml:"models"`
 	// Agent 是 agent 标识与系统提示词。
 	Agent Agent `yaml:"agent,omitempty"`
-	// Workspace 是工具面的路径边界。
-	Workspace Workspace `yaml:"workspace"`
+	// Workspace 是工具面的策略（不含根，见 Workspace 的说明）。
+	Workspace Workspace `yaml:"workspace,omitempty"`
 	// Tools 控制内置工具子集。
 	Tools Tools `yaml:"tools,omitempty"`
 	// SessionsDir 是会话日志目录（JSONL 明文，文件即密钥面）。
@@ -87,9 +94,11 @@ type Config struct {
 	LogsDir string `yaml:"logs_dir,omitempty"`
 }
 
-// Load 读配置、填默认值、校验。path 为空时用 DefaultPath；相对路径一律相对
-// **配置文件真实所在目录**解析（符号链接会先解析到目标目录，因此链接放在哪里
-// 不影响解析结果；这与调用方 CWD 无关）。
+// Load 读配置、填默认值、校验。path 为空时用 DefaultPath；本文件里的相对路径
+// （sessions_dir / logs_dir）相对**配置文件真实所在目录**解析（符号链接会先解析到
+// 目标目录，因此链接放在哪里不影响结果；与调用方 CWD 无关）。
+//
+// 工作区不在本文件里——见包注释。
 func Load(path string) (*Config, error) {
 	if path == "" {
 		path = DefaultPath
@@ -117,8 +126,8 @@ func Load(path string) (*Config, error) {
 	return &c, nil
 }
 
-// finalize 填默认值并把相对路径落到 base 上。失败即配置错误——宁可启动期
-// 明确报错，也不要跑到回合中段才失败。
+// finalize 填默认值并把本文件里的相对目录落到 base 上。失败即配置错误——宁可
+// 启动期明确报错，也不要跑到回合中段才失败。
 func (c *Config) finalize(base string) error {
 	if c.Agent.Name == "" {
 		c.Agent.Name = DefaultAgentName
@@ -143,12 +152,6 @@ func (c *Config) finalize(base string) error {
 			return fmt.Errorf("config: model %q: model is required", m.Name)
 		}
 	}
-	if c.Workspace.Root == "" {
-		return errors.New("config: workspace.root is required (tools resolve relative paths against it)")
-	}
-	c.Workspace.Root = resolve(base, c.Workspace.Root)
-	c.Workspace.WriteRoots = resolveAll(base, c.Workspace.WriteRoots)
-	c.Workspace.ForbidRead = resolveAll(base, c.Workspace.ForbidRead)
 	if c.SessionsDir == "" {
 		c.SessionsDir = DefaultSessionsDir
 	}
@@ -191,15 +194,4 @@ func resolve(base, p string) string {
 		return filepath.Clean(p)
 	}
 	return filepath.Clean(filepath.Join(base, p))
-}
-
-func resolveAll(base string, ps []string) []string {
-	if len(ps) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(ps))
-	for _, p := range ps {
-		out = append(out, resolve(base, p))
-	}
-	return out
 }

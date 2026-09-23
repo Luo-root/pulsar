@@ -1,8 +1,14 @@
 // Package app 是装配层：把 kernel + host 与各能力（模型、工具、会话栈、观测）
 // 接成一个可运行的 runtime。
 //
-// 纪律：所有外部副作用（模型网络、工具执行、落盘）在这里显式 opt-in 一次；
-// 上层（CLI / 本地 API / 前端）一律只经 App 的面调用——API 优先。
+// 两条纪律：
+//
+//  1. 所有外部副作用（模型网络、工具执行、落盘）在这里显式 opt-in 一次；上层
+//     （CLI / 本地 API / 前端）一律只经 App 的面调用——API 优先。
+//  2. **工作区是会话属性，不是 runtime 属性**：建会话时由调用方给出、写进
+//     `SessionHeader.Workspace`、随会话持久化；续跑以会话头记录的为准（调用方
+//     给了不一样的直接拒绝，避免把「接着上次聊」接到另一个项目上）。工具面按
+//     该工作区**每回合装配**——不是装配期定死一个全局根。
 package app
 
 import (
@@ -34,8 +40,17 @@ const HostID = "pulsar"
 // ObservabilityFile 是观测落盘的默认文件名（在 cfg.LogsDir 下）。
 const ObservabilityFile = "observability.log"
 
-// ErrClosed 表示 runtime 已关闭（Close 之后不再接受回合）。
-var ErrClosed = errors.New("app: runtime is closed")
+var (
+	// ErrClosed 表示 runtime 已关闭（Close 之后不再接受回合）。
+	ErrClosed = errors.New("app: runtime is closed")
+	// ErrWorkspaceRequired 表示新建会话时没给工作区——不猜，直接拒绝。
+	ErrWorkspaceRequired = errors.New("app: workspace is required for a new session")
+	// ErrWorkspaceInvalid 表示工作区路径不可用（不存在 / 不是目录）。
+	ErrWorkspaceInvalid = errors.New("app: workspace is invalid")
+	// ErrWorkspaceMismatch 表示续跑时给的工作区与会话记录的不一致（拒绝把会话
+	// 接到另一个项目上）。
+	ErrWorkspaceMismatch = errors.New("app: workspace does not match the session")
+)
 
 // Options 是装配参数。
 type Options struct {
@@ -70,6 +85,9 @@ type App struct {
 }
 
 // New 装配 runtime。失败时不留下半开的资源（已建的文件与内核一并回收）。
+//
+// 注意这里**不注册**内置工具：工具面依赖工作区，而工作区是会话属性——每回合按
+// 该会话的工作区装配（见 buildToolSet）。
 func New(opt Options) (*App, error) {
 	cfg := opt.Config
 	if cfg == nil {
@@ -110,17 +128,6 @@ func New(opt Options) (*App, error) {
 		return nil, err
 	}
 
-	// 工具面：builtins 的路径边界直接来自配置（Root 必填由 config 保证）。
-	tools := host.ToolSource(func(c *kernel.Context, reg *toolset.Registry) error {
-		_, err := builtins.Register(c, reg, builtins.Options{
-			Root:       cfg.Workspace.Root,
-			WriteRoots: cfg.Workspace.WriteRoots,
-			ForbidRead: cfg.Workspace.ForbidRead,
-			Enabled:    cfg.Tools.Enabled,
-		})
-		return err
-	})
-
 	providers := make([]host.Provider, 0, 2+len(opt.Providers))
 	providers = append(providers, openai.Register, anthropic.Register)
 	providers = append(providers, opt.Providers...)
@@ -129,7 +136,6 @@ func New(opt Options) (*App, error) {
 		Kernel:    a.kernel,
 		Providers: providers,
 		Models:    decls,
-		Tools:     []host.ToolSource{tools},
 		Session:   sessions,
 		Observe:   host.ObserveConfig{HostID: HostID, Sink: sink},
 	})
@@ -183,8 +189,8 @@ func (a *App) Close() error {
 // Config 返回生效配置（只读用途）。
 func (a *App) Config() *config.Config { return a.cfg }
 
-// Host 暴露宿主装配（进阶用法：自定义 agent 构造、工具注册面）。Close 之后
-// 返回的是内核已回收的宿主，只可读、不可再发回合。
+// Host 暴露宿主装配（进阶用法：自定义 agent 构造、模型注册面）。Close 之后返回
+// 的是内核已回收的宿主，只可读、不可再发回合。
 func (a *App) Host() *host.Host { return a.host }
 
 // Sessions 暴露会话栈（列表、打开、Fork、导出导入面）。
@@ -202,6 +208,11 @@ func (a *App) track(s session.Session) {
 
 // Turn 是一个回合的请求。
 type Turn struct {
+	// Workspace 是本回合的工作区目录（工具面的根与边界基准）。
+	//
+	// 新建会话（SessionID 为空）时**必填**——不猜、不用默认；它会被写进会话头。
+	// 续跑时可省略（以会话头记录的为准）；给了但与会话记录不一致则拒绝。
+	Workspace string
 	// SessionID 非空 = 打开既有会话续跑（冷恢复语义由会话栈的 store 决定）；
 	// 空 = 新建会话。
 	SessionID string
@@ -215,6 +226,8 @@ type Turn struct {
 type TurnResult struct {
 	// SessionID 是本回合所属会话（新建时即新会话 ID）。
 	SessionID string
+	// Workspace 是本回合生效的工作区（绝对路径；续跑时为会话头记录的那个）。
+	Workspace string
 	// Text 是最终 assistant 消息的文本。
 	Text string
 	// Steps 是实际执行的推理-行动步数。
@@ -225,8 +238,8 @@ type TurnResult struct {
 	Usage llm.TokenUsage
 }
 
-// RunTurn 执行一个回合：装配 agent（模型按名解析、工具取宿主装配、会话按
-// SessionID 新建或打开）→ 跑一轮 ReAct → 回传结论与用量。
+// RunTurn 执行一个回合：解析工作区 → 开/建会话（工作区随会话头持久化）→ 按该
+// 工作区装配本回合工具面 → 跑一轮 ReAct → 回传结论与用量。
 //
 // 返回的 error 仅在基础设施失败（模型调用失败、ctx 取消、落盘失败）时非 nil；
 // 此时 TurnResult 仍可能携带已发生的部分（StoppedBy=canceled/error）。**调用方
@@ -243,11 +256,35 @@ func (a *App) RunTurn(ctx context.Context, t Turn) (*TurnResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	agent, err := a.host.DefaultAgent(ctx, host.DefaultAgentOptions{
+
+	sess, ws, err := a.openSession(ctx, t)
+	if err != nil {
+		return nil, err
+	}
+	a.track(sess)
+
+	// 本回合的工具面：注册挂在派生作用域上，回合结束即撤销（卸载即不可见）。
+	scope, err := a.kernel.Derive()
+	if err != nil {
+		return nil, fmt.Errorf("app: derive turn scope: %w", err)
+	}
+	defer scope.Dispose()
+	tools, err := a.buildToolSet(scope, ws)
+	if err != nil {
+		return nil, err
+	}
+
+	model, err := a.host.Models().Open(decl.Name)
+	if err != nil {
+		return nil, fmt.Errorf("app: open model %q: %w", decl.Name, err)
+	}
+	agent, err := a.host.NewAgent(host.AgentOptions{
 		Name:      a.cfg.Agent.Name,
-		Model:     decl.Name,
+		Model:     model,
+		ModelName: decl.Name,
+		ToolSet:   tools,
+		Session:   sess,
 		System:    a.cfg.Agent.System,
-		SessionID: t.SessionID,
 		ToolGate:  a.gate,
 	})
 	if err != nil {
@@ -262,14 +299,11 @@ func (a *App) RunTurn(ctx context.Context, t Turn) (*TurnResult, error) {
 		return nil, err
 	}
 	out := &TurnResult{
-		SessionID: t.SessionID,
+		SessionID: sess.Header().SessionID,
+		Workspace: ws,
 		Steps:     res.Steps,
 		StoppedBy: res.StoppedBy,
 		Usage:     res.Usage,
-	}
-	if sess := agent.Session(); sess != nil {
-		out.SessionID = sess.Header().SessionID
-		a.track(sess)
 	}
 	if res.Final != nil {
 		out.Text = res.Final.Text()
@@ -277,10 +311,115 @@ func (a *App) RunTurn(ctx context.Context, t Turn) (*TurnResult, error) {
 	return out, err
 }
 
+// openSession 解析本回合的工作区并取到会话句柄：新建会话时把工作区写进会话头；
+// 续跑时以会话头的记录为准，调用方给了不同的工作区直接拒绝。
+func (a *App) openSession(ctx context.Context, t Turn) (session.Session, string, error) {
+	stack := a.host.SessionStack()
+	if stack == nil {
+		return nil, "", errors.New("app: session stack is not configured")
+	}
+	if t.SessionID == "" {
+		ws, err := resolveWorkspace(t.Workspace)
+		if err != nil {
+			return nil, "", err
+		}
+		sess, err := stack.Create(ctx, session.SessionHeader{Workspace: ws})
+		if err != nil {
+			return nil, "", fmt.Errorf("app: create session: %w", err)
+		}
+		return sess, ws, nil
+	}
+
+	sess, err := stack.Open(ctx, t.SessionID)
+	if err != nil {
+		return nil, "", fmt.Errorf("app: open session: %w", err)
+	}
+	recorded := sess.Header().Workspace
+	if recorded == "" {
+		// 会话头里没有工作区（例如更早版本建的会话）：必须由调用方补齐，
+		// 否则无从知道工具该在哪个目录下跑。
+		ws, err := resolveWorkspace(t.Workspace)
+		if err != nil {
+			return nil, "", err
+		}
+		return sess, ws, nil
+	}
+	if t.Workspace == "" {
+		return sess, recorded, nil
+	}
+	ws, err := resolveWorkspace(t.Workspace)
+	if err != nil {
+		return nil, "", err
+	}
+	if ws != recorded {
+		return nil, "", fmt.Errorf("%w: 会话 %s 在 %s，调用方给了 %s",
+			ErrWorkspaceMismatch, t.SessionID, recorded, ws)
+	}
+	return sess, recorded, nil
+}
+
+// buildToolSet 按工作区装配本回合的工具面：builtins 的 Root 就是该工作区，策略
+// 里的相对路径相对它解析。注册是 scope 上的效应，scope 销毁即整批撤销。
+func (a *App) buildToolSet(scope *kernel.Context, ws string) (loop.ToolSet, error) {
+	reg := toolset.NewRegistry()
+	if _, err := builtins.Register(scope, reg, builtins.Options{
+		Root:       ws,
+		WriteRoots: resolvePatterns(ws, a.cfg.Workspace.WriteRoots),
+		ForbidRead: resolvePatterns(ws, a.cfg.Workspace.ForbidRead),
+		Enabled:    a.cfg.Tools.Enabled,
+	}); err != nil {
+		return nil, fmt.Errorf("app: register builtins for workspace %s: %w", ws, err)
+	}
+	return reg.AsToolSet(), nil
+}
+
 func (a *App) isClosed() bool {
 	a.sessMu.Lock()
 	defer a.sessMu.Unlock()
 	return a.closed
+}
+
+// resolveWorkspace 归一化工作区：必须是存在的目录，返回解析符号链接后的绝对路径
+// （绝对化让「不同写法指向同一目录」的比对可靠）。
+func resolveWorkspace(p string) (string, error) {
+	if p == "" {
+		return "", ErrWorkspaceRequired
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", fmt.Errorf("%w: %s: %v", ErrWorkspaceInvalid, p, err)
+	}
+	if resolved, rerr := filepath.EvalSymlinks(abs); rerr == nil {
+		abs = resolved
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("%w: %s: %v", ErrWorkspaceInvalid, p, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%w: %s 不是目录", ErrWorkspaceInvalid, p)
+	}
+	return abs, nil
+}
+
+// resolvePatterns 把策略里的相对路径按工作区解析成绝对路径（builtins 的
+// WriteRoots / ForbidRead 要绝对前缀）。
+func resolvePatterns(ws string, ps []string) []string {
+	if len(ps) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ps))
+	for _, p := range ps {
+		out = append(out, resolve(ws, p))
+	}
+	return out
+}
+
+func resolve(base, p string) string {
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p)
+	}
+	return filepath.Clean(filepath.Join(base, p))
 }
 
 // modelDecls 把配置里的模型声明翻译成 host 的声明，顺带把凭据从环境变量取出来

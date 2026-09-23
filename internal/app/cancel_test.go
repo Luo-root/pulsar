@@ -3,17 +3,14 @@ package app_test
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/Luo-root/pulse/host"
 	"github.com/Luo-root/pulse/kernel"
 	"github.com/Luo-root/pulse/llm"
 	"github.com/Luo-root/pulse/loop"
 	"github.com/Luo-root/pulse/memory/session"
-	"github.com/Luo-root/pulse/observability"
 
 	"github.com/Luo-root/pulsar/internal/app"
 )
@@ -52,26 +49,18 @@ func (m *cancelOnceModel) Stream(ctx context.Context, req *llm.GenerateRequest) 
 	return ch, nil
 }
 
-// TestRunTurn_CancelClosesTurnAndResumes 盯住取消语义（Ctrl+C / 上游取消同一条路径）：
-// 取消后回合必须**闭合**（turn.ended 记 interrupted），且同一会话下一回合能正常续跑。
+// TestRunTurn_CancelClosesTurnAndResumes 盯住取消语义（Ctrl+C / 上游取消同一条
+// 路径）：取消后回合必须**闭合**（turn.ended 记 interrupted），且同一会话下一
+// 回合能正常续跑。
 func TestRunTurn_CancelClosesTurnAndResumes(t *testing.T) {
 	cfg := testConfig(t)
 	model := &cancelOnceModel{entered: make(chan struct{})}
-	a, err := app.New(app.Options{
-		Config: cfg,
-		Sink:   observability.NewLineSink(io.Discard),
-		Providers: []host.Provider{
-			func(c *kernel.Context, reg *llm.Registry) error {
-				_, err := reg.RegisterProvider(c, llm.ProviderScripted, func(llm.Config) (llm.ChatModel, error) {
-					return model, nil
-				})
-				return err
-			},
-		},
+	a := newAppWith(t, cfg, func(c *kernel.Context, reg *llm.Registry) error {
+		_, err := reg.RegisterProvider(c, llm.ProviderScripted, func(llm.Config) (llm.ChatModel, error) {
+			return model, nil
+		})
+		return err
 	})
-	if err != nil {
-		t.Fatalf("app.New: %v", err)
-	}
 	defer a.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -81,7 +70,7 @@ func TestRunTurn_CancelClosesTurnAndResumes(t *testing.T) {
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		res, err := a.RunTurn(ctx, app.Turn{Prompt: "这一轮会被取消"})
+		res, err := a.RunTurn(ctx, app.Turn{Workspace: t.TempDir(), Prompt: "这一轮会被取消"})
 		done <- outcome{res: res, err: err}
 	}()
 
@@ -140,7 +129,7 @@ func TestRunTurn_CancelClosesTurnAndResumes(t *testing.T) {
 		t.Fatalf("turn.ended reason = %q, want %q", lastTurnEnd.Reason, session.ReasonInterrupted)
 	}
 
-	// 同一会话续跑：取消过的会话应当能接着用。
+	// 同一会话续跑：取消过的会话应当能接着用（工作区取自会话头）。
 	second, err := a.RunTurn(context.Background(), app.Turn{
 		SessionID: first.res.SessionID,
 		Prompt:    "接着来",
@@ -150,5 +139,8 @@ func TestRunTurn_CancelClosesTurnAndResumes(t *testing.T) {
 	}
 	if second.Text != "续跑成功。" {
 		t.Fatalf("续跑 text = %q", second.Text)
+	}
+	if second.Workspace != first.res.Workspace {
+		t.Fatalf("续跑 workspace = %q, want %q", second.Workspace, first.res.Workspace)
 	}
 }

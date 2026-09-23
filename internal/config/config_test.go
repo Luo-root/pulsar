@@ -15,8 +15,6 @@ models:
   - name: main
     provider: openai
     model: gpt-5
-workspace:
-  root: .
 `
 
 // writeConfig 把配置正文落进 dir/pulsar.yaml，返回文件路径。
@@ -52,9 +50,6 @@ func TestLoad_DefaultsAndRelativePaths(t *testing.T) {
 	if cfg.Agent.Name != config.DefaultAgentName {
 		t.Fatalf("agent.name = %q, want %q", cfg.Agent.Name, config.DefaultAgentName)
 	}
-	if want := realDir(t, base); cfg.Workspace.Root != want {
-		t.Fatalf("workspace.root = %q, want %q", cfg.Workspace.Root, want)
-	}
 	if want := filepath.Join(realDir(t, base), config.DefaultSessionsDir); cfg.SessionsDir != want {
 		t.Fatalf("sessions_dir = %q, want %q", cfg.SessionsDir, want)
 	}
@@ -66,7 +61,10 @@ func TestLoad_DefaultsAndRelativePaths(t *testing.T) {
 	}
 }
 
-func TestLoad_RelativeAndAbsolutePaths(t *testing.T) {
+// TestLoad_WorkspacePoliciesStayVerbatim 盯住「策略不在这里烙成绝对路径」：
+// write_roots / forbid_read 必须原样保留——它们的相对基准是**回合时生效的工作区**，
+// 不是配置文件所在目录。
+func TestLoad_WorkspacePoliciesStayVerbatim(t *testing.T) {
 	base := t.TempDir()
 	absDir := t.TempDir()
 	body := fmt.Sprintf(`
@@ -75,8 +73,7 @@ models:
     provider: openai
     model: gpt-5
 workspace:
-  root: ./ws
-  write_roots: ["./ws/out", %q]
+  write_roots: ["./out", %q]
   forbid_read: ["./.git"]
 sessions_dir: ./state/sessions
 logs_dir: ./state/logs
@@ -85,19 +82,14 @@ logs_dir: ./state/logs
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+	if got := cfg.Workspace.WriteRoots; len(got) != 2 || got[0] != "./out" || got[1] != absDir {
+		t.Fatalf("write_roots = %v，应当原样保留（回合时相对工作区解析）", got)
+	}
+	if got := cfg.Workspace.ForbidRead; len(got) != 1 || got[0] != "./.git" {
+		t.Fatalf("forbid_read = %v，应当原样保留", got)
+	}
+	// 而配置自己的目录类字段仍相对配置文件目录解析。
 	real := realDir(t, base)
-	if want := filepath.Join(real, "ws"); cfg.Workspace.Root != want {
-		t.Fatalf("root = %q, want %q", cfg.Workspace.Root, want)
-	}
-	if want := filepath.Join(real, "ws", "out"); cfg.Workspace.WriteRoots[0] != want {
-		t.Fatalf("write_roots[0] = %q, want %q", cfg.Workspace.WriteRoots[0], want)
-	}
-	if want := realDir(t, absDir); cfg.Workspace.WriteRoots[1] != want {
-		t.Fatalf("write_roots[1] = %q, want 原样的绝对路径 %q", cfg.Workspace.WriteRoots[1], want)
-	}
-	if want := filepath.Join(real, ".git"); cfg.Workspace.ForbidRead[0] != want {
-		t.Fatalf("forbid_read[0] = %q, want %q", cfg.Workspace.ForbidRead[0], want)
-	}
 	if want := filepath.Join(real, "state", "sessions"); cfg.SessionsDir != want {
 		t.Fatalf("sessions_dir = %q, want %q", cfg.SessionsDir, want)
 	}
@@ -112,32 +104,24 @@ func TestLoad_Errors(t *testing.T) {
 		body string
 		want string
 	}{
-		{"没有模型", `workspace: {root: .}`, "models is empty"},
+		{"没有模型", `agent: {name: x}`, "models is empty"},
 		{"模型重名", `
 models:
   - {name: a, provider: p, model: m}
   - {name: a, provider: p, model: m}
-workspace: {root: .}
 `, "duplicate name"},
 		{"模型缺名字", `
 models:
   - {provider: p, model: m}
-workspace: {root: .}
 `, "name is required"},
 		{"模型缺 provider", `
 models:
   - {name: a, model: m}
-workspace: {root: .}
 `, "provider is required"},
 		{"模型缺 model", `
 models:
   - {name: a, provider: p}
-workspace: {root: .}
 `, "model is required"},
-		{"缺 workspace.root", `
-models:
-  - {name: a, provider: p, model: m}
-`, "workspace.root is required"},
 		{"YAML 语法坏", "models: [}", "parse"},
 	}
 	for _, c := range cases {
@@ -189,7 +173,6 @@ func TestConfig_ModelLookup(t *testing.T) {
 models:
   - {name: first, provider: openai, model: m1}
   - {name: second, provider: anthropic, model: m2}
-workspace: {root: .}
 `))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -206,7 +189,7 @@ workspace: {root: .}
 }
 
 // TestLoad_SymlinkedConfigResolvesToTargetDir 盯住「相对基准 = 配置真实所在目录」：
-// 把配置软链到别处，相对路径仍应落在**目标**目录下。
+// 把配置软链到别处，配置自身的相对目录仍应落在**目标**目录下。
 func TestLoad_SymlinkedConfigResolvesToTargetDir(t *testing.T) {
 	real := t.TempDir()
 	realCfg := writeConfig(t, real, minimal)
@@ -219,10 +202,10 @@ func TestLoad_SymlinkedConfigResolvesToTargetDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if want := realDir(t, real); cfg.Workspace.Root != want {
-		t.Fatalf("root = %q, want 链接目标 %q", cfg.Workspace.Root, want)
+	if want := filepath.Join(realDir(t, real), config.DefaultSessionsDir); cfg.SessionsDir != want {
+		t.Fatalf("sessions_dir = %q, want 链接目标下的 %q", cfg.SessionsDir, want)
 	}
-	if cfg.Workspace.Root == realDir(t, linkDir) {
+	if strings.HasPrefix(cfg.SessionsDir, realDir(t, linkDir)) {
 		t.Fatal("相对基准落到了链接所在目录——EvalSymlinks 没生效")
 	}
 }
