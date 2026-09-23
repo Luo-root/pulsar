@@ -648,6 +648,8 @@ pulsar/
 
 依赖纪律（对齐 pulse 自己的分层）：`orchestrator` **只依赖自己的 Runner 接口**，不 import `harness`；共享内容（记忆、技能）通过装配层注入的 seam 传递。`harness` 不感知具体是哪个外部产品。
 
+**仓库门面待补**（对齐 pulse / pulse-web，随手补齐、不阻塞功能）：`CONTRIBUTING.md` / `SECURITY.md` / `CODE_OF_CONDUCT.md`、`.github/ISSUE_TEMPLATE/` + `PULL_REQUEST_TEMPLATE.md`、`.github/workflows/ci.yml`（`build` / `vet` / `gofmt -l` 非空即失败 / `test`）、`AGENTS.md`（本仓 AI 协作约定）。
+
 ### 6.3 本地开发
 
 `go.mod` 用 `replace` 指向本地克隆，改动即时生效：
